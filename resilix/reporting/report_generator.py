@@ -223,6 +223,10 @@ class ReportGenerator:
     def _executive_summary(self, result: TestResult,
                            score: ResilienceScore) -> Dict[str, Any]:
         maximum = float(score.maximum or 100.0)
+        # Public score representation: the same display-clamped total the
+        # resilience_score section reports — never the raw, possibly
+        # out-of-range value.
+        display_total = round(_clamp(float(score.total), maximum), 1)
         return {
             "test_id": result.test_id,
             "target": result.target,
@@ -230,7 +234,7 @@ class ReportGenerator:
             "scenario": result.scenario_name,
             "status": self._status_name(result),
             "resilience_score": {
-                "total": round(float(score.total), 1),
+                "total": display_total,
                 "maximum": maximum,
             },
             "assessment": self._executive_assessment(result, score),
@@ -238,7 +242,12 @@ class ReportGenerator:
 
     def _executive_assessment(self, result: TestResult,
                               score: ResilienceScore) -> str:
-        parts = [f"Resilience score {score.total:.1f}/{score.maximum:g}."]
+        # Quote the display-clamped total (same value the resilience_score
+        # section reports), so every score representation in the report and
+        # on the dashboard agrees.
+        maximum = float(score.maximum or 100.0)
+        total = _clamp(float(score.total), maximum)
+        parts = [f"Resilience score {total:.1f}/{maximum:g}."]
         state = self._status_name(result)
         if state == "completed":
             parts.append("Test completed.")
@@ -482,8 +491,10 @@ class ReportGenerator:
     def _final_assessment(self, result: TestResult, score: ResilienceScore,
                           events: List[DegradationEvent], peak: MetricSnapshot,
                           recs: List[Recommendation]) -> Dict[str, Any]:
-        total = float(score.total)
+        # Display-clamped like the resilience_score section; the raw value
+        # stays on the source object and is never shown.
         maximum = float(score.maximum or 100.0)
+        total = _clamp(float(score.total), maximum)
         category = self.assessment.category_for(total)
         return {
             "category": category,

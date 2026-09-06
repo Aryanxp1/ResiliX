@@ -72,6 +72,22 @@ class TestResilienceScore:
         assert result.resilience.total == 300.0
         assert result.resilience.components[1].earned == 300.0
 
+    # -- regression: every public score representation quotes the same ------
+    # -- display-clamped total (never the raw, impossible "300.0/100"). -----
+    def test_executive_summary_quotes_display_clamped_total(self, result):
+        summary = generate_report(result)["executive_summary"]
+        assert summary["resilience_score"]["total"] == 100.0
+        assert summary["resilience_score"]["maximum"] == 100.0
+        assert "300" not in summary["assessment"]
+        assert "Resilience score 100.0/100." in summary["assessment"]
+
+    def test_final_assessment_quotes_display_clamped_total(self, result):
+        final = generate_report(result)["final_assessment"]
+        assert final["score"] == 100.0
+        assert final["maximum"] == 100.0
+        assert "300" not in final["summary"]
+        assert "Overall resilience: Excellent (100.0/100)." in final["summary"]
+
     def test_recomputed_when_score_missing(self, result):
         result.resilience = ResilienceScore(total=0.0, maximum=0.0)
         score = generate_report(result)["resilience_score"]
