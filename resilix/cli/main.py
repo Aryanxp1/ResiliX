@@ -14,6 +14,8 @@ Commands
 * ``baseline`` — run a controlled baseline measurement only.
 * ``analyze``  — analyze a previously collected test result (JSON) using the
                  existing analysis modules.
+* `report`   — passively render a saved test result as a structured report
+                 (JSON / Markdown / terminal text).
 
 Invocation
 ----------
@@ -856,6 +858,43 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_report(args: argparse.Namespace) -> int:
+    """Render a saved test-result JSON file as a structured report.
+
+    Passively reads the saved result through the reporting layer (no engines,
+    no network, no target access) and renders it as JSON, Markdown or plain
+    terminal text. Returns exit code 0 on success, 2 on any clean
+    user-facing error (missing file, invalid JSON, unrecognised result).
+    """
+    from ..reporting import ReportingError, load_result
+    from ..reporting.report_generator import to_json, to_markdown, to_terminal
+
+    try:
+        result = load_result(args.result_file)
+    except ReportingError as exc:
+        return _fail(str(exc))
+
+    renderers = {
+        "json": to_json,
+        "markdown": to_markdown,
+        "terminal": to_terminal,
+    }
+    try:
+        text = renderers[args.format](result)
+    except Exception as exc:  # noqa: BLE001 - report defects surface cleanly
+        return _fail(f"Could not render report: {exc}")
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as exc:
+            _warn(f"Could not write report file '{args.output}': {exc}")
+    else:
+        print(text)
+    return 0
+
+
 
 # ---------------------------------------------------------------------------
 # Argument parser construction
@@ -1011,6 +1050,36 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o", "--output",
         help="Write analysis (score + events + recommendations) as JSON.",
     )
+
+    # ---- report --------------------------------------------------------------
+    rep = sub.add_parser(
+        "report",
+        help="Render a saved test result (JSON) as a structured report.",
+        description="Passively read a saved JSON test result and render it as a "
+                    "structured resilience report in JSON, Markdown or plain "
+                    "terminal text. The report derives entirely from the recorded "
+                    "result: no engines run, no network traffic, no target access.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python -m resilix.cli.main report results.json --format json\n"
+            "  python -m resilix.cli.main report results.json --format "
+            "markdown -o report.md\n"
+        ),
+    )
+    rep.add_argument(
+        "result_file",
+        help="Path to a JSON test result file.",
+    )
+    rep.add_argument(
+        "--format", "--fmt", dest="format", default="markdown",
+        choices=["json", "markdown", "terminal"],
+        help="Report output format (default: markdown).",
+    )
+    rep.add_argument(
+        "-o", "--output",
+        help="Write the rendered report to this file instead of stdout.",
+    )
     return p
 
 
@@ -1024,6 +1093,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "test": _cmd_test,
         "baseline": _cmd_baseline,
         "analyze": _cmd_analyze,
+        "report": _cmd_report,
     }
     handler = handlers.get(args.command)
     if handler is None:
