@@ -14,8 +14,10 @@ Commands
 * ``baseline`` — run a controlled baseline measurement only.
 * ``analyze``  — analyze a previously collected test result (JSON) using the
                  existing analysis modules.
-* `report`   — passively render a saved test result as a structured report
+* ``report``   — passively render a saved test result as a structured report
                  (JSON / Markdown / terminal text).
+* ``dashboard`` — serve a local-only, passive visual dashboard for a saved
+                  test result (no engines, no traffic, loopback bind only).
 
 Invocation
 ----------
@@ -895,11 +897,60 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# dashboard command
+# ---------------------------------------------------------------------------
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the local-only visual dashboard for a saved test result.
+
+    Completely passive: binds to a loopback address (default 127.0.0.1),
+    serves the bundled static page and the report data prepared by the
+    existing reporting layer. Never runs engines, never touches targets,
+    never sends traffic. Ctrl+C shuts the server down cleanly.
+    """
+    from ..dashboard import DEFAULT_HOST, DEFAULT_PORT, DashboardServer
+
+    try:
+        server = DashboardServer(
+            report_path=args.report,
+            host=args.host,
+            port=args.port,
+        )
+    except ValueError as exc:
+        return _fail(str(exc))
+    except OSError as exc:
+        return _fail(f"Could not bind dashboard server: {exc}")
+
+    _print_banner()
+    print(f"ResiliX dashboard (passive, local-only)")
+    _kv("Report", server.report_path or "(none)")
+    _kv("Address", server.url)
+    if server.data.get("ok"):
+        _kv("Test ID", server.data.get("test", {}).get("test_id", "") or "(unknown)")
+    else:
+        _warn(f"Report problem: {server.data.get('error', 'unknown')}")
+    print("Open the URL above in a browser. Press Ctrl+C to stop.")
+
+    if getattr(args, "open", False):
+        import webbrowser
+        webbrowser.open(server.url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down dashboard...")
+    finally:
+        server.shutdown()
+    return 0
+
+
 
 # ---------------------------------------------------------------------------
 # Argument parser construction
 # ---------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
+    from ..dashboard import DEFAULT_HOST, DEFAULT_PORT
+
     p = argparse.ArgumentParser(
         prog="resilix",
         description=(
@@ -910,6 +961,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "            against an authorized target.\n"
             "  baseline  Run a controlled baseline measurement only.\n"
             "  analyze   Analyze a previously saved test result (JSON).\n"
+            "  report    Render a saved test result as a structured report.\n"
+            "  dashboard Serve a local-only visual dashboard for a saved result.\n"
             "\n"
             "All runs are governed by the central safety layer: target allowlist, hard\n"
             "rate/concurrency/duration limits, and a global emergency stop (Ctrl+C).\n"
@@ -1080,6 +1133,42 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o", "--output",
         help="Write the rendered report to this file instead of stdout.",
     )
+
+    # ---- dashboard -----------------------------------------------------------
+    dash = sub.add_parser(
+        "dashboard",
+        help="Serve a local-only visual dashboard for a saved test result.",
+        description="Passively visualize a saved JSON test result (resilience "
+                    "score, degradation, recovery, time series) in the browser. "
+                    "The server binds to a loopback address only (default "
+                    "127.0.0.1) and never runs engines, touches targets or "
+                    "sends traffic — it only reads the saved result.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python -m resilix.cli.main dashboard --report results/latest.json\n"
+            "  python -m resilix.cli.main dashboard --report r.json --port 9000\n"
+        ),
+    )
+    dash.add_argument(
+        "--report",
+        help="Path to a JSON test result file (as written by "
+             "'resilix test --output'). Optional: without it the dashboard "
+             "starts and shows guidance instead of data.",
+    )
+    dash.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help="Bind address. Loopback addresses only — the dashboard is "
+             f"local-only (default: {DEFAULT_HOST}).",
+    )
+    dash.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"Port to listen on (default: {DEFAULT_PORT}).",
+    )
+    dash.add_argument(
+        "--open", action="store_true",
+        help="Open the dashboard in the default web browser.",
+    )
     return p
 
 
@@ -1094,6 +1183,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "baseline": _cmd_baseline,
         "analyze": _cmd_analyze,
         "report": _cmd_report,
+        "dashboard": _cmd_dashboard,
     }
     handler = handlers.get(args.command)
     if handler is None:
