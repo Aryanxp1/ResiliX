@@ -1,624 +1,628 @@
-/* ResiliX Dashboard front-end.
- *
- * Strictly a *renderer* for data prepared by the ResiliX Python layer
- * (/api/data). This script contains no scoring, degradation, recovery or
- * recommendation logic — all analysis arrives already computed. It also
- * performs zero network requests other than fetching /api/data from the
- * local dashboard server, and renders every report-provided string via
- * textContent (never innerHTML) so report content can never inject HTML.
- */
 "use strict";
+(function() {
+  const app = {
+    currentView: "overview",
+    currentTestId: null,
+    livePollingInterval: null,
+    state: {
+      overview: null,
+      tests: [],
+      findings: [],
+      settings: null,
+      live: null,
+      consoleState: "idle",
+      searchResults: null,
+      validationResult: null
+    },
 
-(function () {
-  // ------------------------------------------------------------- utilities
-  function $(id) { return document.getElementById(id); }
+    async init() {
+      this.attachListeners();
+      await this.loadAllData();
+      this.render("overview");
+    },
 
-  function setText(el, text) {
-    if (el) { el.textContent = text == null ? "" : String(text); }
-  }
+    async loadAllData() {
+      try {
+        const [s, o, t, f, st] = await Promise.all([
+          api.state(), api.overview(), api.tests(), api.findings(), api.settings()
+        ]);
+        this.state.consoleState = s.state;
+        this.state.overview = o;
+        this.state.tests = t.tests || [];
+        this.state.findings = f.findings || [];
+        this.state.settings = st;
+        this.updateStatusIndicator();
+      } catch(e) {
+        console.error("Load error:", e);
+      }
+    },
 
-  function fmtNum(value, digits) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return "—";
-    }
-    var n = Number(value);
-    if (digits === undefined) { digits = 1; }
-    return n.toFixed(digits);
-  }
+    updateStatusIndicator() {
+      const dot = document.querySelector(".status-dot");
+      const text = document.querySelector(".status-text");
+      if (dot) dot.className = "status-dot " + this.state.consoleState;
+      if (text) text.textContent = this.state.consoleState.toUpperCase();
+    },
 
-  function fmtInt(value) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return "—";
-    }
-    return Number(value).toLocaleString("en-US");
-  }
-
-  function fmtPct(value, digits) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return "n/a";
-    }
-    return Number(value).toFixed(digits === undefined ? 1 : digits) + "%";
-  }
-
-  function fmtSignedPct(value) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return null;
-    }
-    var n = Number(value);
-    return (n > 0 ? "+" : "") + n.toFixed(1) + "%";
-  }
-
-  function fmtSec(value) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return null;
-    }
-    return Number(value).toFixed(1) + "s";
-  }
-
-  function titleCase(text) {
-    return String(text || "").replace(/\b\w/g, function (c) { return c.toUpperCase(); });
-  }
-
-  function changeClass(value) {
-    if (value === null || value === undefined || isNaN(Number(value))) {
-      return "";
-    }
-    var n = Number(value);
-    if (n > 0.05) { return "bad"; }   // higher latency/error than baseline
-    if (n < -0.05) { return "good"; }
-    return "";
-  }
-
-  function clearChildren(el) {
-    while (el && el.firstChild) { el.removeChild(el.firstChild); }
-  }
-
-  function el(tag, className, text) {
-    var node = document.createElement(tag);
-    if (className) { node.className = className; }
-    if (text !== undefined && text !== null) { node.textContent = String(text); }
-    return node;
-  }
-
-  // ---------------------------------------------------------- state switch
-  function showOnly(ids) {
-    var all = ["state-error", "state-empty", "dashboard"];
-    all.forEach(function (id) {
-      $(id).classList.toggle("hidden", ids.indexOf(id) === -1);
-    });
-  }
-
-  function showError(message) {
-    setText($("error-message"), message);
-    setText($("meta-status"), "error");
-    $("meta-status").className = "meta-chip status-chip err";
-    showOnly(["state-error"]);
-  }
-
-  function showEmpty() {
-    setText($("meta-status"), "no data");
-    $("meta-status").className = "meta-chip status-chip err";
-    showOnly(["state-empty"]);
-  }
-
-  // ------------------------------------------------------------------ boot
-  function boot() {
-    fetch("/api/data", { credentials: "omit" })
-      .then(function (res) {
-        if (!res.ok) { throw new Error("HTTP " + res.status + " from /api/data"); }
-        return res.json();
-      })
-      .then(function (payload) {
-        if (!payload || payload.ok !== true) {
-          showError((payload && payload.error) || "Unknown error loading report data.");
-          return;
+    attachListeners() {
+      document.addEventListener("click", (e) => {
+        if (e.target.classList.contains("nav-item")) {
+          document.querySelectorAll(".nav-item").forEach(b => b.classList.remove("active"));
+          e.target.classList.add("active");
+          this.render(e.target.dataset.view);
         }
-        render(payload);
-      })
-      .catch(function (err) {
-        showError("Could not load dashboard data: " + err.message);
+        if (e.target.dataset.action === "stop-test") this.stopTest();
+        if (e.target.dataset.action === "emergency-stop") this.confirmEmergencyStop();
+        if (e.target.dataset.action === "view-test") this.viewTestDetail(e.target.dataset.testId);
+        if (e.target.dataset.action === "new-test-nav") {
+          document.querySelectorAll(".nav-item").forEach(b => b.classList.remove("active"));
+          const nt = document.querySelector("[data-view='new-test']");
+          if (nt) nt.classList.add("active");
+          this.render("new-test");
+        }
       });
-  }
-
-  // ---------------------------------------------------------------- render
-  function render(data) {
-    var meta = data.meta || {};
-    setText($("meta-version"), "v" + (meta.resilix_version || "?"));
-
-    var test = data.test || {};
-    var overview = data.overview || {};
-    var metrics = data.metrics || {};
-    var score = data.score || {};
-
-    // Insufficient data guard: a result without a test id or without any
-    // recorded operations/samples cannot be visualized meaningfully.
-    var hasOps = Number(metrics.requests || 0) > 0;
-    var hasSamples = Array.isArray(data.series) && data.series.length > 0;
-    if (!test.test_id && !hasOps && !hasSamples) {
-      showEmpty();
-      return;
-    }
-
-    setText($("meta-status"), String(test.status || "unknown"));
-    $("meta-status").className = "meta-chip status-chip " +
-      (String(test.status) === "completed" ? "ok" : "err");
-
-    renderHeader(data);
-    renderKpis(data);
-    renderScore(score, meta);
-    renderComparison(data);
-    renderSafety(data);
-    renderRecovery(data);
-    renderDegradation(data);
-    renderRecommendations(data);
-    renderSeries(data);
-    renderFooter(data, meta);
-    showOnly(["dashboard"]);
-  }
-
-  function renderHeader(data) {
-    var test = data.test || {};
-    var overview = data.overview || {};
-
-    setText($("test-target"), test.target || "(no target recorded)");
-
-    var status = $("test-status");
-    var statusText = String(test.status || "unknown");
-    setText(status, statusText);
-    status.className = "status-badge " +
-      (statusText === "completed" ? "" :
-       (statusText === "aborted" || statusText === "error") ? "bad" : "warn");
-
-    var parts = [];
-    if (test.engine) { parts.push(titleCase(test.engine) + " engine"); }
-    if (test.scenario) { parts.push("scenario: " + test.scenario); }
-    if (overview.test_duration_sec !== null &&
-        overview.test_duration_sec !== undefined) {
-      parts.push("duration: " + fmtSec(overview.test_duration_sec));
-    }
-    if (test.test_id) { parts.push("test id: " + test.test_id); }
-    setText($("test-subtitle"), parts.join("  ·  "));
-
-    var phaseRow = $("test-phases");
-    clearChildren(phaseRow);
-    (test.phases || []).forEach(function (phase) {
-      if (phase && phase.name) {
-        phaseRow.appendChild(el("span", "phase-pill",
-          phase.name + (phase.samples ? " (" + phase.samples + ")" : "")));
+      const si = document.getElementById("search-input");
+      if (si) {
+        let st;
+        si.addEventListener("input", (e) => {
+          clearTimeout(st);
+          const q = e.target.value.trim();
+          if (q.length > 2) {
+            st = setTimeout(() => this.performSearch(q), 300);
+          }
+        });
       }
-    });
-  }
+    },
 
-  function renderKpis(data) {
-    var overview = data.overview || {};
-    var metrics = data.metrics || {};
-    var comparisons = data.comparisons || {};
-
-    // Score card
-    var max = Number(overview.score_maximum || 100);
-    var total = Number(overview.resilience_score || 0);
-    setText($("kpi-score"), fmtNum(total, 1));
-    setText($("kpi-score-max"), "/ " + fmtNum(max, max % 1 ? 1 : 0));
-    var pct = max > 0 ? Math.max(0, Math.min(100, (total / max) * 100)) : 0;
-    $("kpi-score-bar").style.width = pct.toFixed(1) + "%";
-    setText($("kpi-assessment"), titleCase(overview.assessment || ""));
-
-    // Availability
-    setText($("kpi-availability"), fmtPct(metrics.availability_pct));
-    setText($("kpi-operations"),
-      fmtInt(metrics.successes) + " ok / " + fmtInt(metrics.failures) +
-      " failed of " + fmtInt(metrics.requests) + " ops");
-
-    // Peak p95 latency
-    setText($("kpi-p95"), fmtNum(metrics.p95_latency_ms, 0) + " ms");
-    var p95Change = fmtSignedPct(comparisons.p95_change_pct);
-    var p95Note = $("kpi-p95-change");
-    if (p95Change === null) {
-      setText(p95Note, "no baseline comparison");
-      p95Note.className = "kpi-note";
-    } else {
-      setText(p95Note, p95Change + " vs baseline");
-      p95Note.className = "kpi-note " + changeClass(comparisons.p95_change_pct);
-    }
-
-    // Throughput
-    setText($("kpi-throughput"), fmtNum(metrics.throughput_req_sec, 1) + " req/s");
-    var thrNote = $("kpi-throughput-change");
-    var thrVsBaseline = comparisons.throughput_vs_baseline_pct;
-    if (thrVsBaseline === null || thrVsBaseline === undefined) {
-      setText(thrNote, "baseline not recorded");
-      thrNote.className = "kpi-note";
-    } else {
-      setText(thrNote, fmtNum(thrVsBaseline, 0) + "% of baseline throughput");
-      thrNote.className = "kpi-note " +
-        (Number(thrVsBaseline) >= 100 ? "good" : "warn");
-    }
-
-    // Error rate
-    setText($("kpi-errors"), fmtPct(metrics.error_rate_pct));
-    var errNote = $("kpi-error-detail");
-    var errChange = comparisons.error_rate_change_pct;
-    if (Number(metrics.failures) === 0 && Number(metrics.error_rate_pct) === 0) {
-      setText(errNote, "no failures recorded");
-      errNote.className = "kpi-note good";
-    } else if (errChange === null || errChange === undefined) {
-      setText(errNote, "baseline error rate not recorded");
-      errNote.className = "kpi-note warn";
-    } else {
-      setText(errNote, fmtSignedPct(errChange) + " vs baseline");
-      errNote.className = "kpi-note " + changeClass(errChange);
-    }
-
-    // Recovery
-    var recovery = data.recovery || {};
-    var recValue = $("kpi-recovery");
-    var recNote = $("kpi-recovery-note");
-    if (recovery.collected === true && recovery.details &&
-        recovery.details.recovery_time_sec !== null &&
-        recovery.details.recovery_time_sec !== undefined) {
-      setText(recValue, fmtSec(recovery.details.recovery_time_sec));
-      setText(recNote, "recovery time");
-    } else if (recovery.collected === true) {
-      setText(recValue, "measured");
-      setText(recNote, recovery.summary || "");
-    } else {
-      setText(recValue, "—");
-      setText(recNote, "recovery metrics not collected");
-    }
-  }
-
-  // -------------------------------------------------------- section panels
-  function renderScore(score) {
-    var list = $("score-components");
-    clearChildren(list);
-    (score.components || []).forEach(function (comp) {
-      var maximum = Number(comp.maximum || 100);
-      var earned = Number(comp.earned || 0);
-      var fraction = maximum > 0 ? Math.max(0, Math.min(1, earned / maximum)) : 0;
-      var item = el("li");
-      var row = el("div", "score-row");
-      row.appendChild(el("span", "score-name", comp.name || "Component"));
-      row.appendChild(el("span", "score-nums",
-        fmtNum(earned, 1) + " / " + fmtNum(maximum, maximum % 1 ? 1 : 0)));
-      item.appendChild(row);
-      var track = el("div", "score-track");
-      var fill = el("div", "score-fill" +
-        (fraction < 0.4 ? " low" : fraction < 0.7 ? " mid" : ""));
-      fill.style.width = (fraction * 100).toFixed(1) + "%";
-      track.appendChild(fill);
-      item.appendChild(track);
-      if (comp.rationale) {
-        item.appendChild(el("p", "score-rationale", comp.rationale));
+    render(name) {
+      document.querySelectorAll(".view").forEach(v => v.classList.add("hidden"));
+      const view = document.getElementById("view-" + name);
+      if (view) {
+        view.classList.remove("hidden");
+        this.currentView = name;
+        this.renderView(name);
       }
-      list.appendChild(item);
-    });
+    },
 
-    var bits = [];
-    if (score.assessment) { bits.push("Assessment: " + titleCase(score.assessment)); }
-    if (score.source) { bits.push("score source: " + score.source); }
-    setText($("score-summary"), bits.join("  ·  "));
-  }
+    renderView(name) {
+      const views = {
+        "overview": () => this.renderOverview(),
+        "new-test": () => this.renderNewTest(),
+        "tests": () => this.renderTests(),
+        "test-detail": () => this.renderTestDetail(),
+        "findings": () => this.renderFindings(),
+        "live": () => this.renderLive(),
+        "reports": () => this.renderReports(),
+        "settings": () => this.renderSettings()
+      };
+      if (views[name]) views[name]();
+    },
 
-  function kvTable(rows) {
-    var table = el("table", "kv-table");
-    var tbody = el("tbody");
-    rows.forEach(function (row) {
-      var tr = el("tr");
-      tr.appendChild(el("td", null, row.label));
-      if (row.value === null || row.value === undefined || row.value === "") {
-        tr.appendChild(el("td", "na", row.fallback || "not recorded"));
+    ce(tag, cls, parent) {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (parent) parent.appendChild(e);
+      return e;
+    },
+
+    txt(text, parent) {
+      const e = document.createTextNode(text == null ? "" : text);
+      if (parent) parent.appendChild(e);
+      return e;
+    },
+    renderOverview() {
+      const v = document.getElementById("view-overview");
+      if (!v) return;
+      const ov = this.state.overview || {};
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Overview";
+      this.ce("p", null, header).textContent = "Resilience Operations Console";
+      const grid = this.ce("div", "overview-grid", v);
+      const kpis = [
+        ["Tests", ov.total_tests || 0],
+        ["Latest Score", ov.latest_score != null ? ov.latest_score.toFixed(1) : "—"],
+        ["Findings", this.state.findings.length || 0],
+        ["Active Test", ov.active_test_id || "NONE"]
+      ];
+      kpis.forEach(([label, value]) => {
+        const card = this.ce("div", "kpi-card", grid);
+        this.ce("div", "kpi-label", card).textContent = label;
+        this.ce("div", "kpi-value", card).textContent = value;
+      });
+      const section = this.ce("section", "panel", v);
+      this.ce("h2", "panel-title", section).textContent = "Recent Tests";
+      this.ce("div", "recent-tests", section);
+      this.populateRecentTests();
+    },
+
+    populateRecentTests(container) {
+      if (!container) container = document.getElementById("recent-tests");
+      if (!container) return;
+      container.textContent = "";
+      const table = this.ce("table", "data-table", container);
+      const thead = this.ce("thead", null, table);
+      const hrow = this.ce("tr", null, thead);
+      ["Status", "ID", "Target", "Engine", "Score"].forEach(h => this.ce("th", null, hrow).textContent = h);
+      const tbody = this.ce("tbody", null, table);
+      (this.state.tests || []).slice(0, 5).forEach(t => {
+        const row = this.ce("tr", null, tbody);
+        const sc = this.ce("td", null, row);
+        const ss = this.ce("span", "status-badge " + (t.status || ""), sc);
+        ss.textContent = t.status || "—";
+        const ic = this.ce("td", null, row);
+        const il = this.ce("a", null, ic);
+        il.href = "#";
+        il.textContent = t.id || "—";
+        il.dataset.action = "view-test";
+        il.dataset.testId = t.id || "";
+        this.ce("td", null, row).textContent = t.target || "—";
+        this.ce("td", null, row).textContent = t.engine || "—";
+        this.ce("td", null, row).textContent = t.score != null ? t.score.toFixed(1) : "—";
+      });
+    },
+    renderNewTest() {
+      const v = document.getElementById("view-new-test");
+      if (!v) return;
+      const s = this.state.settings || {};
+      const f = s.safety || {};
+      const e = s.engines || [];
+      const c = s.scenarios || [];
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "New Test";
+      this.ce("p", null, header).textContent = "Configure a controlled resilience test";
+      const form = this.ce("form", "test-form", v);
+      form.id = "f";
+      // Target
+      const tg = this.ce("div", "form-group", form);
+      this.ce("label", null, tg).textContent = "Target *";
+      const ti = this.ce("input", null, tg);
+      ti.type = "text"; ti.id = "target"; ti.required = true; ti.placeholder = "127.0.0.1";
+      // Engine
+      const eg = this.ce("div", "form-group", form);
+      this.ce("label", null, eg).textContent = "Engine *";
+      const es = this.ce("select", null, eg);
+      es.id = "engine"; es.required = true;
+      this.ce("option", null, es).textContent = "— Select Engine —";
+      e.forEach(x => { const o = this.ce("option", null, es); o.value = x; o.textContent = x.toUpperCase(); });
+      // Scenario
+      const sg = this.ce("div", "form-group", form);
+      this.ce("label", null, sg).textContent = "Scenario *";
+      const ss = this.ce("select", null, sg);
+      ss.id = "scenario"; ss.required = true;
+      this.ce("option", null, ss).textContent = "— Select Scenario —";
+      c.forEach(x => { const o = this.ce("option", null, ss); o.value = x; o.textContent = x.replace(/-/g, " "); });
+      // Duration
+      const dg = this.ce("div", "form-group", form);
+      this.ce("label", null, dg).textContent = "Duration (s)";
+      const di = this.ce("input", null, dg);
+      di.type = "number"; di.id = "duration"; di.value = "30"; di.min = 1; di.max = f.max_duration_sec || 120;
+      this.ce("small", "form-hint", dg).textContent = "Max: " + (f.max_duration_sec || 120) + "s";
+      // Start Rate
+      const srg = this.ce("div", "form-group", form);
+      this.ce("label", null, srg).textContent = "Start Rate";
+      const sri = this.ce("input", null, srg);
+      sri.type = "number"; sri.id = "start_rate"; sri.value = "10"; sri.min = 1;
+      this.ce("small", "form-hint", srg).textContent = "Max: " + (f.max_rate_per_sec || 1000);
+      // Max Rate
+      const mrg = this.ce("div", "form-group", form);
+      this.ce("label", null, mrg).textContent = "Max Rate";
+      const mri = this.ce("input", null, mrg);
+      mri.type = "number"; mri.id = "max_rate"; mri.value = "50"; mri.min = 1;
+      this.ce("small", "form-hint", mrg).textContent = "Max: " + (f.max_rate_per_sec || 1000);
+      // Concurrency
+      const cg = this.ce("div", "form-group", form);
+      this.ce("label", null, cg).textContent = "Concurrency";
+      const ci = this.ce("input", null, cg);
+      ci.type = "number"; ci.id = "concurrency"; ci.value = "5"; ci.min = 1;
+      this.ce("small", "form-hint", cg).textContent = "Max: " + (f.max_concurrency || 100);
+      // Validation result
+      this.ce("div", "validation-result", form).id = "validation-result";
+      // Buttons
+      const bg = this.ce("div", "btn-group", form);
+      const vb = this.ce("button", "btn btn-primary", bg);
+      vb.type = "button"; vb.id = "vbtn"; vb.textContent = "VALIDATE";
+      const rb = this.ce("button", "btn btn-success", bg);
+      rb.type = "button"; rb.id = "rbtn"; rb.textContent = "RUN TEST"; rb.disabled = true;
+      // Safety panel
+      const sp = this.ce("div", "safety-panel", v);
+      this.ce("h3", null, sp).textContent = "Safety Envelope";
+      const sl = this.ce("ul", "safety-list", sp);
+      ["Emergency Stop: ENABLED", "Target Allowlist: ENABLED", "Max Duration: " + (f.max_duration_sec || 120) + "s", "Max Rate: " + (f.max_rate_per_sec || 1000), "Max Concurrency: " + (f.max_concurrency || 100), "Max Operations: " + (f.max_operations || 10000), "Max Connections: " + (f.max_connections || 50)].forEach(i => this.ce("li", null, sl).textContent = i);
+      this.setupNewTestForm();
+    },
+    setupNewTestForm() {
+      const vb = document.getElementById("vbtn");
+      const rb = document.getElementById("rbtn");
+      if (!vb || !rb) return;
+      vb.onclick = async () => {
+        const config = this.collectFormData();
+        if (!config) return;
+        vb.textContent = "VALIDATING...";
+        vb.disabled = true;
+        try {
+          const res = await api.validate(config);
+          this.displayValidationResult(res);
+          rb.disabled = !res.ok;
+        } catch(e) {
+          this.displayValidationError(e.message);
+          rb.disabled = true;
+        } finally {
+          vb.textContent = "VALIDATE";
+          vb.disabled = false;
+        }
+      };
+      rb.onclick = async () => {
+        const config = this.collectFormData();
+        if (!config) return;
+        rb.textContent = "STARTING...";
+        rb.disabled = true;
+        try {
+          await api.start(config);
+          await this.loadAllData();
+          this.render("live");
+        } catch(e) {
+          alert("Failed: " + e.message);
+          rb.textContent = "RUN TEST";
+          rb.disabled = false;
+        }
+      };
+    },
+
+    collectFormData() {
+      const t = document.getElementById("target");
+      const e = document.getElementById("engine");
+      const s = document.getElementById("scenario");
+      if (!t || !t.value.trim()) { this.displayValidationError("Target is required"); return null; }
+      if (!e || !e.value) { this.displayValidationError("Engine is required"); return null; }
+      if (!s || !s.value) { this.displayValidationError("Scenario is required"); return null; }
+      const config = { target: t.value.trim(), engine: e.value, scenario: s.value };
+      const d = document.getElementById("duration");
+      if (d && d.value) config.duration_sec = parseInt(d.value, 10) || 30;
+      const sr = document.getElementById("start_rate");
+      if (sr && sr.value) config.start_rate = parseInt(sr.value, 10) || 10;
+      const mr = document.getElementById("max_rate");
+      if (mr && mr.value) config.max_rate = parseInt(mr.value, 10) || 50;
+      const c = document.getElementById("concurrency");
+      if (c && c.value) config.concurrency = parseInt(c.value, 10) || 5;
+      return config;
+    },
+
+    displayValidationResult(result) {
+      const el = document.getElementById("validation-result");
+      if (!el) return;
+      el.textContent = "";
+      if (result.ok) {
+        const p = this.ce("p", "validation-success", el);
+        p.textContent = "Configuration Valid";
       } else {
-        tr.appendChild(el("td", "kv-value" + (row.cls ? " " + row.cls : ""),
-          String(row.value)));
+        const p = this.ce("p", "validation-error", el);
+        p.textContent = "Validation Failed";
+        if (result.checks) {
+          const list = this.ce("ul", "validation-checks", el);
+          result.checks.forEach(check => {
+            const li = this.ce("li", null, list);
+            li.textContent = (check.passed ? "[PASS] " : "[FAIL] ") + (check.message || check.name || "Check");
+          });
+        }
       }
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    return table;
-  }
+    },
 
-  function renderComparison(data) {
-    var body = $("comparison-body");
-    clearChildren(body);
-    var baseline = data.baseline || {};
-    var peak = data.peak || {};
-    var comparisons = data.comparisons || {};
-    var thrVs = comparisons.throughput_vs_baseline_pct;
-    var thrKnown = thrVs !== null && thrVs !== undefined;
-
-    body.appendChild(kvTable([
-      { label: "Throughput (baseline → peak)",
-        value: fmtNum(baseline.rate_per_sec, 1) + " → " +
-               fmtNum(peak.rate_per_sec, 1) + " req/s" },
-      { label: "Throughput vs baseline",
-        value: thrKnown ? fmtNum(thrVs, 0) + "%" : null,
-        cls: thrKnown && Number(thrVs) >= 100 ? "good" : "warn" },
-      { label: "Avg latency (baseline → peak)",
-        value: fmtNum(baseline.avg_latency_ms, 0) + " → " +
-               fmtNum(peak.avg_latency_ms, 0) + " ms" },
-      { label: "Avg latency change",
-        value: fmtSignedPct(comparisons.avg_latency_change_pct),
-        cls: changeClass(comparisons.avg_latency_change_pct) },
-      { label: "p95 latency (baseline → peak)",
-        value: fmtNum(baseline.p95_ms, 0) + " → " + fmtNum(peak.p95_ms, 0) + " ms" },
-      { label: "p95 change",
-        value: fmtSignedPct(comparisons.p95_change_pct),
-        cls: changeClass(comparisons.p95_change_pct) },
-      { label: "p99 latency (baseline → peak)",
-        value: fmtNum(baseline.p99_ms, 0) + " → " + fmtNum(peak.p99_ms, 0) + " ms" },
-      { label: "Error rate (baseline → peak)",
-        value: fmtPct(baseline.error_rate_pct) + " → " + fmtPct(peak.error_rate_pct) },
-    ]));
-
-    var notCollected = data.not_collected || [];
-    if (notCollected.length) {
-      body.appendChild(el("p", "score-rationale",
-        "Not collected by this engine: " + notCollected.join(", ")));
-    }
-  }
-
-  function renderSafety(data) {
-    var body = $("safety-body");
-    clearChildren(body);
-    var safety = data.safety || {};
-    var status = String(safety.status || "");
-    body.appendChild(kvTable([
-      { label: "Guards", value: status,
-        cls: status.indexOf("ENABLED") === 0 ? "good" : "warn" },
-      { label: "Target allowlist",
-        value: safety.require_authorized_target ? "required" : "not required" },
-      { label: "Emergency stop",
-        value: safety.allow_emergency_stop ? "enabled" : "disabled" },
-      { label: "Max duration", value: fmtSec(safety.max_duration_sec) },
-      { label: "Max concurrency", value: fmtInt(safety.max_concurrency) },
-      { label: "Max rate", value: fmtNum(safety.max_rate_per_sec, 0) + " req/s" },
-      { label: "Max total operations", value: fmtInt(safety.max_total_operations) },
-      { label: "Max connections", value: fmtInt(safety.max_connections) },
-    ]));
-  }
-
-  function renderRecovery(data) {
-    var body = $("recovery-body");
-    clearChildren(body);
-    var recovery = data.recovery || {};
-    if (recovery.collected !== true || !recovery.details) {
-      body.appendChild(el("p", "empty-note", recovery.summary ||
-        "Recovery metrics were not collected for this test."));
-      return;
-    }
-    var details = recovery.details;
-    body.appendChild(kvTable([
-      { label: "Recovery time", value: fmtSec(details.recovery_time_sec) },
-      { label: "Note", value: details.note || "" },
-    ]));
-    var row = el("div", "check-row");
-    [["latency_recovered", "latency"],
-     ["error_rate_recovered", "error rate"],
-     ["throughput_recovered", "throughput"]].forEach(function (pair) {
-      var ok = details[pair[0]] === true;
-      row.appendChild(el("span", "check-pill " + (ok ? "ok" : "fail"),
-        pair[1] + (ok ? " recovered" : " not recovered")));
-    });
-    body.appendChild(row);
-  }
-
-  function renderDegradation(data) {
-    var body = $("degradation-body");
-    clearChildren(body);
-    var degradation = data.degradation || {};
-    var events = degradation.events || [];
-    setText($("degradation-count"), String(events.length));
-    if (!events.length) {
-      body.appendChild(el("p", "empty-note",
-        degradation.summary || "No degradation events recorded."));
-      return;
-    }
-    events.forEach(function (ev) {
-      var row = el("div", "event");
-      var sev = String(ev.severity || "info");
-      row.appendChild(el("span", "sev-tag " + sev, sev));
-      var main = el("div", "event-main");
-      main.appendChild(el("p", "event-message", ev.message || ev.metric || ""));
-      var metaBits = [];
-      if (ev.phase) { metaBits.push("phase: " + ev.phase); }
-      if (ev.metric) { metaBits.push("metric: " + ev.metric); }
-      if (ev.change_pct !== null && ev.change_pct !== undefined) {
-        metaBits.push("change: " + fmtSignedPct(ev.change_pct));
+    displayValidationError(message) {
+      const el = document.getElementById("validation-result");
+      if (el) {
+        el.textContent = "";
+        const p = this.ce("p", "validation-error", el);
+        p.textContent = message || "Validation failed";
       }
-      metaBits.push("observed: " + fmtNum(ev.observed, 1) +
-                    " vs threshold " + fmtNum(ev.threshold, 1));
-      if (ev.timestamp !== null && ev.timestamp !== undefined) {
-        metaBits.push("t=" + fmtNum(ev.timestamp, 1) + "s");
+    },
+    renderLive() {
+      const v = document.getElementById("view-live");
+      if (!v) return;
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Live Feed";
+      const isRunning = this.state.consoleState === "running" || this.state.consoleState === "starting";
+      if (!isRunning) {
+        const empty = this.ce("div", "empty-state", v);
+        this.ce("p", null, empty).textContent = "No Active Test";
+        this.ce("p", null, empty).textContent = "There is currently no running resilience test.";
+        const btn = this.ce("button", "btn btn-primary", empty);
+        btn.textContent = "+ New Test";
+        btn.dataset.action = "new-test-nav";
+        return;
       }
-      main.appendChild(el("p", "event-meta", metaBits.join("  ·  ")));
-      row.appendChild(main);
-      body.appendChild(row);
-    });
-  }
-
-  function renderRecommendations(data) {
-    var body = $("recommendations-body");
-    clearChildren(body);
-    var recs = data.recommendations || {};
-    var items = recs.items || recs.recommendations || [];
-    setText($("recommendations-count"),
-      String(recs.count !== undefined ? recs.count : items.length));
-    if (!items.length) {
-      body.appendChild(el("p", "empty-note",
-        "No recommendations recorded for this test."));
-      return;
-    }
-    items.forEach(function (rec) {
-      var row = el("div", "rec");
-      var priority = String(rec.priority || "medium");
-      row.appendChild(el("span", "rec-priority " + priority, priority));
-      var main = el("div", "event-main");
-      main.appendChild(el("p", "rec-title",
-        (rec.category ? "[" + rec.category + "] " : "") + (rec.title || "")));
-      if (rec.detail) { main.appendChild(el("p", "rec-detail", rec.detail)); }
-      if (rec.evidence) { main.appendChild(el("p", "rec-evidence", rec.evidence)); }
-      row.appendChild(main);
-      body.appendChild(row);
-    });
-  }
-
-  function renderFooter(data, meta) {
-    var overview = data.overview || {};
-    var bits = [];
-    if (meta.generated_at) { bits.push("report generated " + meta.generated_at); }
-    if (meta.report_schema_version !== undefined) {
-      bits.push("schema v" + meta.report_schema_version);
-    }
-    if (overview.target) { bits.push("target " + overview.target); }
-    setText($("footer-meta"), bits.join("  ·  "));
-  }
-
-  // ------------------------------------------------------------ time series
-  var SERIES_METRICS = [
-    { key: "p95_ms", label: "p95 latency", unit: "ms", digits: 0, color: "#00e5a0" },
-    { key: "avg_latency_ms", label: "avg latency", unit: "ms", digits: 0, color: "#4da3ff" },
-    { key: "error_rate_pct", label: "error rate", unit: "%", digits: 1, color: "#ff5d73" },
-    { key: "rate_per_sec", label: "throughput", unit: "req/s", digits: 1, color: "#9d7bff" }
-  ];
-
-  var currentMetricKey = SERIES_METRICS[0].key;
-
-  function svgEl(tag, attrs) {
-    var node = document.createElementNS("http://www.w3.org/2000/svg", tag);
-    Object.keys(attrs || {}).forEach(function (name) {
-      node.setAttribute(name, String(attrs[name]));
-    });
-    return node;
-  }
-
-  function renderSeries(data) {
-    var series = Array.isArray(data.series) ? data.series : [];
-    var chart = $("series-chart");
-    var caption = $("series-caption");
-    var toggle = $("series-toggle");
-    var empty = $("series-empty");
-    clearChildren(chart);
-    clearChildren(toggle);
-
-    if (series.length < 2) {
-      empty.classList.remove("hidden");
-      $("series-figure").classList.add("hidden");
-      setText(caption, "");
-      return;
-    }
-    empty.classList.add("hidden");
-    $("series-figure").classList.remove("hidden");
-
-    // Metric selector (pure view concern: which recorded series to display).
-    SERIES_METRICS.forEach(function (metric) {
-      var button = el("button", metric.key === currentMetricKey ? "active" : "",
-        metric.label);
-      button.addEventListener("click", function () {
-        currentMetricKey = metric.key;
-        renderSeries(data);
+      const ls = this.state.live || {};
+      const grid = this.ce("div", "live-info-grid", v);
+      [["Status", ls.status || "Running"], ["Test ID", ls.test_id || "—"], ["Target", ls.target || "—"], ["Engine", ls.engine || "—"], ["Scenario", ls.scenario || "—"], ["Elapsed", ls.elapsed_sec ? ls.elapsed_sec + "s" : "—"]].forEach(([label, value]) => {
+        const item = this.ce("div", "live-info-item", grid);
+        this.ce("span", "live-info-label", item).textContent = label;
+        this.ce("span", "live-info-value", item).textContent = value;
       });
-      toggle.appendChild(button);
-    });
-
-    var metric = null;
-    SERIES_METRICS.forEach(function (m) {
-      if (m.key === currentMetricKey) { metric = m; }
-    });
-    if (!metric) { metric = SERIES_METRICS[0]; }
-
-    var width = 900, height = 300;
-    var padLeft = 56, padRight = 18, padTop = 16, padBottom = 34;
-    var plotW = width - padLeft - padRight;
-    var plotH = height - padTop - padBottom;
-
-    var xs = series.map(function (p) { return Number(p.t_rel || 0); });
-    var ys = series.map(function (p) { return Number(p[metric.key] || 0); });
-    var xMin = Math.min.apply(null, xs);
-    var xMax = Math.max.apply(null, xs);
-    var yMax = Math.max.apply(null, ys);
-    if (xMax === xMin) { xMax = xMin + 1; }
-    if (yMax <= 0) { yMax = 1; }
-    yMax = yMax * 1.08;
-
-    function px(x) {
-      return padLeft + ((x - xMin) / (xMax - xMin)) * plotW;
-    }
-    function py(y) {
-      return padTop + plotH - (y / yMax) * plotH;
-    }
-
-    // Horizontal grid lines + y labels (5 ticks).
-    for (var i = 0; i <= 4; i++) {
-      var yVal = yMax * i / 4;
-      var yPix = py(yVal);
-      chart.appendChild(svgEl("line", {
-        x1: padLeft, x2: width - padRight, y1: yPix, y2: yPix,
-        "class": "chart-grid-line"
-      }));
-      var label = svgEl("text", {
-        x: padLeft - 8, y: yPix + 4, "text-anchor": "end",
-        "class": "chart-axis-label"
+      const metrics = this.ce("div", "live-metrics", v);
+      this.ce("h2", "section-title", metrics).textContent = "Live Metrics";
+      const mg = this.ce("div", "metrics-grid", metrics);
+      [["Operations", ls.operations || 0], ["Successful", ls.successful || 0], ["Errors", ls.errors || 0], ["Current Rate", ls.current_rate || 0], ["P95 Latency", ls.p95_latency_ms ? ls.p95_latency_ms + "ms" : "—"], ["Error Rate", ls.error_rate ? (ls.error_rate * 100).toFixed(1) + "%" : "—"]].forEach(([label, value]) => {
+        const card = this.ce("div", "metric-card", mg);
+        this.ce("div", "metric-label", card).textContent = label;
+        this.ce("div", "metric-value", card).textContent = value;
       });
-      label.textContent = yVal >= 100 ? yVal.toFixed(0) : yVal.toFixed(1);
-      chart.appendChild(label);
+      const actions = this.ce("div", "live-actions", v);
+      const stopBtn = this.ce("button", "btn btn-danger", actions);
+      stopBtn.textContent = "STOP TEST";
+      stopBtn.dataset.action = "stop-test";
+      const emBtn = this.ce("button", "btn btn-danger-glow", actions);
+      emBtn.textContent = "EMERGENCY STOP";
+      emBtn.dataset.action = "emergency-stop";
+      this.startLivePolling();
+    },
+
+    async startLivePolling() {
+      if (this.livePollingInterval) return;
+      this.livePollingInterval = setInterval(async () => {
+        try {
+          const state = await api.state();
+          this.state.consoleState = state.state;
+          this.updateStatusIndicator();
+          if (state.state !== "running" && state.state !== "starting") {
+            this.stopLivePolling();
+            await this.loadAllData();
+            if (this.currentView === "live") this.render("tests");
+            return;
+          }
+          const live = await api.live();
+          this.state.live = live;
+        } catch(e) {
+          console.error("Live poll error:", e);
+        }
+      }, 2000);
+    },
+
+    stopLivePolling() {
+      if (this.livePollingInterval) {
+        clearInterval(this.livePollingInterval);
+        this.livePollingInterval = null;
+      }
+    },
+
+    async stopTest() {
+      if (!confirm("Stop the current test?")) return;
+      try {
+        await api.stop();
+        this.stopLivePolling();
+        await this.loadAllData();
+        this.render("tests");
+      } catch(e) {
+        alert("Stop failed: " + e.message);
+      }
+    },
+
+    async confirmEmergencyStop() {
+      if (!confirm("EMERGENCY STOP: This will immediately halt all operations. Continue?")) return;
+      try {
+        await api.emergencyStop();
+        this.stopLivePolling();
+        await this.loadAllData();
+        this.render("tests");
+      } catch(e) {
+        alert("Emergency stop failed: " + e.message);
+      }
+    },
+    renderTests() {
+      const v = document.getElementById("view-tests");
+      if (!v) return;
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Tests";
+      const tests = this.state.tests || [];
+      if (tests.length === 0) {
+        const empty = this.ce("div", "empty-state", v);
+        this.ce("p", null, empty).textContent = "No tests recorded yet.";
+        const btn = this.ce("button", "btn btn-primary", empty);
+        btn.textContent = "+ New Test";
+        btn.dataset.action = "new-test-nav";
+        return;
+      }
+      const table = this.ce("table", "data-table", v);
+      const thead = this.ce("thead", null, table);
+      const hrow = this.ce("tr", null, thead);
+      ["Status", "ID", "Target", "Engine", "Scenario", "Score", "Duration"].forEach(h => this.ce("th", null, hrow).textContent = h);
+      const tbody = this.ce("tbody", null, table);
+      tests.forEach(t => {
+        const row = this.ce("tr", null, tbody);
+        row.style.cursor = "pointer";
+        row.onclick = () => this.viewTestDetail(t.id);
+        const sc = this.ce("td", null, row);
+        const ss = this.ce("span", "status-badge " + (t.status || ""), sc);
+        ss.textContent = t.status || "—";
+        this.ce("td", null, row).textContent = t.id || "—";
+        this.ce("td", null, row).textContent = t.target || "—";
+        this.ce("td", null, row).textContent = t.engine || "—";
+        this.ce("td", null, row).textContent = t.scenario || "—";
+        this.ce("td", null, row).textContent = t.score != null ? t.score.toFixed(1) : "—";
+        this.ce("td", null, row).textContent = t.duration_sec ? t.duration_sec + "s" : "—";
+      });
+    },
+
+    async viewTestDetail(testId) {
+      this.currentTestId = testId;
+      this.render("test-detail");
+    },
+
+    renderTestDetail() {
+      const v = document.getElementById("view-test-detail");
+      if (!v) return;
+      v.textContent = "";
+      const test = this.state.tests.find(t => t.id === this.currentTestId);
+      const header = this.ce("div", "view-header", v);
+      const back = this.ce("a", "back-link", header);
+      back.href = "#";
+      back.textContent = "< All Tests";
+      back.onclick = (e) => { e.preventDefault(); this.render("tests"); };
+      if (!test) {
+        this.ce("p", null, v).textContent = "Test not found";
+        return;
+      }
+      this.ce("h1", null, header).textContent = test.id || "Test Detail";
+      const ss = this.ce("span", "status-badge " + (test.status || ""), header);
+      ss.textContent = test.status || "—";
+      const info = this.ce("div", "detail-info-grid", v);
+      [["Target", test.target || "—"], ["Engine", test.engine || "—"], ["Scenario", test.scenario || "—"], ["Duration", test.duration_sec ? test.duration_sec + "s" : "—"], ["Score", test.score != null ? test.score.toFixed(1) : "—"]].forEach(([label, value]) => {
+        const item = this.ce("div", "detail-info-item", info);
+        this.ce("span", "detail-info-label", item).textContent = label;
+        this.ce("span", "detail-info-value", item).textContent = value;
+      });
+      const actions = this.ce("div", "detail-actions", v);
+      const repBtn = this.ce("button", "btn btn-primary", actions);
+      repBtn.textContent = "View Report";
+      repBtn.onclick = () => this.render("reports");
+      if (test.status === "running") {
+        const stopBtn = this.ce("button", "btn btn-danger", actions);
+        stopBtn.textContent = "Stop Test";
+        stopBtn.dataset.action = "stop-test";
+      }
+      const findingsSection = this.ce("section", "panel", v);
+      this.ce("h2", "panel-title", findingsSection).textContent = "Findings";
+      const findingsList = this.ce("div", "findings-list", findingsSection);
+      const testFindings = this.state.findings.filter(f => f.test_id === test.id);
+      if (testFindings.length === 0) {
+        this.ce("p", "empty-message", findingsList).textContent = "No findings for this test";
+      } else {
+        testFindings.forEach(f => {
+          const item = this.ce("div", "finding-item", findingsList);
+          const sev = this.ce("span", "severity-badge " + (f.severity || "info"), item);
+          sev.textContent = f.severity || "info";
+          this.ce("p", null, item).textContent = f.message || f.description || "—";
+        });
+      }
+    },
+    renderFindings() {
+      const v = document.getElementById("view-findings");
+      if (!v) return;
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Findings";
+      const findings = this.state.findings || [];
+      if (findings.length === 0) {
+        this.ce("p", "empty-state", v).textContent = "No findings recorded";
+        return;
+      }
+      const list = this.ce("div", "findings-list", v);
+      findings.forEach(f => {
+        const item = this.ce("div", "finding-item", list);
+        const sev = this.ce("span", "severity-badge " + (f.severity || "info"), item);
+        sev.textContent = f.severity || "info";
+        this.ce("p", null, item).textContent = f.message || f.description || "—";
+        if (f.test_id) {
+          const link = this.ce("a", null, item);
+          link.href = "#";
+          link.textContent = "Test: " + f.test_id;
+          link.onclick = (e) => { e.preventDefault(); this.viewTestDetail(f.test_id); };
+        }
+      });
+    },
+    renderReports() {
+      const v = document.getElementById("view-reports");
+      if (!v) return;
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Reports";
+      const tests = this.state.tests || [];
+      const completed = tests.filter(t => t.status === "completed" || t.status === "stopped");
+      if (completed.length === 0) {
+        this.ce("p", "empty-state", v).textContent = "No reports available";
+        return;
+      }
+      const table = this.ce("table", "data-table", v);
+      const thead = this.ce("thead", null, table);
+      const hrow = this.ce("tr", null, thead);
+      ["Test ID", "Target", "Score", "Status", "Actions"].forEach(h => this.ce("th", null, hrow).textContent = h);
+      const tbody = this.ce("tbody", null, table);
+      completed.forEach(t => {
+        const row = this.ce("tr", null, tbody);
+        this.ce("td", null, row).textContent = t.id || "—";
+        this.ce("td", null, row).textContent = t.target || "—";
+        this.ce("td", null, row).textContent = t.score != null ? t.score.toFixed(1) : "—";
+        this.ce("td", null, row).textContent = t.status || "—";
+        const actions = this.ce("td", null, row);
+        const viewBtn = this.ce("button", "btn btn-small", actions);
+        viewBtn.textContent = "View";
+        viewBtn.onclick = () => this.viewTestDetail(t.id);
+      });
+    },
+
+    renderSettings() {
+      const v = document.getElementById("view-settings");
+      if (!v) return;
+      v.textContent = "";
+      const header = this.ce("div", "view-header", v);
+      this.ce("h1", null, header).textContent = "Settings";
+      const s = this.state.settings || {};
+      const f = s.safety || {};
+      const e = s.engines || [];
+      const section = this.ce("section", "panel", v);
+      this.ce("h2", "panel-title", section).textContent = "Safety Envelope";
+      const table = this.ce("table", "settings-table", section);
+      [["Emergency Stop", "ENABLED"], ["Target Allowlist", "ENABLED"], ["Max Duration", (f.max_duration_sec || 120) + "s"], ["Max Rate", (f.max_rate_per_sec || 1000) + "/s"], ["Max Concurrency", f.max_concurrency || 100], ["Max Operations", f.max_operations || 10000], ["Max Connections", f.max_connections || 50]].forEach(([label, value]) => {
+        const row = this.ce("tr", null, table);
+        this.ce("td", null, row).textContent = label;
+        this.ce("td", "setting-value", row).textContent = value;
+      });
+      const engineSection = this.ce("section", "panel", v);
+      this.ce("h2", "panel-title", engineSection).textContent = "Engine Availability";
+      const engineList = this.ce("ul", "engine-list", engineSection);
+      ["http", "api", "database", "mobile"].forEach(en => {
+        const li = this.ce("li", null, engineList);
+        li.textContent = en.toUpperCase() + ": " + (e.includes(en) ? "AVAILABLE" : "NOT AVAILABLE");
+      });
+    },
+
+    async performSearch(query) {
+      try {
+        const res = await api.search(query);
+        this.state.searchResults = res;
+      } catch(e) {
+        console.error("Search error:", e);
+      }
     }
-
-    // Area fill + line.
-    var points = series.map(function (p, idx) {
-      return px(xs[idx]).toFixed(1) + "," + py(ys[idx]).toFixed(1);
-    });
-    chart.appendChild(svgEl("polygon", {
-      points: padLeft + "," + py(0) + " " + points.join(" ") + " " +
-              px(xMax).toFixed(1) + "," + py(0),
-      fill: metric.color, "class": "chart-area"
-    }));
-    chart.appendChild(svgEl("polyline", {
-      points: points.join(" "), stroke: metric.color, "class": "chart-line"
-    }));
-
-    // Dots (with title tooltip showing the recorded values).
-    series.forEach(function (p, idx) {
-      var dot = svgEl("circle", {
-        cx: px(xs[idx]).toFixed(1), cy: py(ys[idx]).toFixed(1), r: 3.2,
-        fill: metric.color, "class": "chart-dot"
+  };
+  // API client
+  const api = {
+    async get(path) {
+      const res = await fetch("/api" + path);
+      if (!res.ok) throw new Error("API error: " + res.status);
+      return res.json();
+    },
+    async post(path, data) {
+      const res = await fetch("/api" + path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
       });
-      var tip = svgEl("title");
-      tip.textContent = "t=" + fmtNum(p.t_rel, 1) + "s — " +
-        metric.label + ": " + fmtNum(ys[idx], metric.digits) + " " + metric.unit +
-        (p.phase ? " (" + p.phase + ")" : "");
-      dot.appendChild(tip);
-      chart.appendChild(dot);
-    });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "API error: " + res.status);
+      return json;
+    },
+    state() { return this.get("/console/state"); },
+    overview() { return this.get("/console/overview"); },
+    tests() { return this.get("/console/tests"); },
+    findings() { return this.get("/console/findings"); },
+    settings() { return this.get("/console/settings"); },
+    live() { return this.get("/console/live"); },
+    search(q) { return this.get("/console/search?q=" + encodeURIComponent(q)); },
+    validate(config) { return this.post("/console/validate", config); },
+    start(config) { return this.post("/console/start", config); },
+    stop() { return this.post("/console/stop", {}); },
+    emergencyStop() { return this.post("/console/emergency-stop", {}); }
+  };
 
-    // X axis labels (start / mid / end).
-    [xMin, (xMin + xMax) / 2, xMax].forEach(function (xVal, idx) {
-      var anchor = idx === 0 ? "start" : idx === 1 ? "middle" : "end";
-      var xLabel = svgEl("text", {
-        x: px(xVal).toFixed(1), y: height - 10, "text-anchor": anchor,
-        "class": "chart-axis-label"
-      });
-      xLabel.textContent = fmtNum(xVal, 1) + "s";
-      chart.appendChild(xLabel);
-    });
-
-    // Legend.
-    var legend = svgEl("g", { transform: "translate(" + width / 2 + ", " + (padTop + 4) + ")" });
-    var legendText = svgEl("text", { "text-anchor": "middle", "class": "chart-axis-label" });
-    legendText.textContent = metric.label + " (" + metric.unit + ") over test time";
-    legend.appendChild(legendText);
-    chart.appendChild(legend);
-
-    setText(caption, "Recorded metric samples only (n=" + series.length +
-      ") — plotted directly from the saved result; no interpolation.");
-  }
-
+  window.app = app;
+  window.api = api;
+  
   if (document.readyState === "loading") {
-
-
-
-
-    document.addEventListener("DOMContentLoaded", boot);
+    document.addEventListener("DOMContentLoaded", () => app.init());
   } else {
-    boot();
+    app.init();
   }
 })();

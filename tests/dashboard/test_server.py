@@ -159,3 +159,30 @@ def test_server_with_broken_report_serves_clean_error(tmp_path):
         assert payload["ok"] is False
     finally:
         server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Brand asset serving (UI refinement)
+# ---------------------------------------------------------------------------
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def test_logo_asset_is_served(server):
+    status, body = _get(server.url + "assets/resilix-logo.png")
+    assert status == 200
+    assert body.startswith(PNG_MAGIC)
+    assert len(body) > 1000
+
+
+def test_reference_banner_is_not_served(server):
+    # The banner is a design reference only — the browser must never
+    # receive it as a dashboard asset.
+    status, _ = _get_error(server.url + "assets/resilix-banner.png")
+    assert status == 404
+
+
+def test_asset_route_cannot_be_abused_for_traversal(server):
+    for route in ("assets/../dashboard.py", "assets/..%2Fdashboard.py",
+                  "assets/dashboard.py", "assets/", "assets"):
+        status, _ = _get_error(server.url + route)
+        assert status == 404, route

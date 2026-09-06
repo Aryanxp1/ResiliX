@@ -4,153 +4,56 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>ResiliX Dashboard</title>
+  <title>ResiliX — Resilience Operations Console</title>
   <link rel="stylesheet" href="/styles.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e1420'/%3E%3Cpath d='M16 5l9 4v7c0 5.2-3.4 9.4-9 11-5.6-1.6-9-5.8-9-11V9l9-4z' fill='none' stroke='%2300e5a0' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2305090d'/%3E%3Cpath d='M16 4l10 4.4v7.4c0 5.6-3.8 10.2-10 12.2-6.2-2-10-6.6-10-12.2V8.4L16 4z' fill='none' stroke='%232ce8d2' stroke-width='2'/%3E%3Cpath d='M19.5 10.5h-6.2l-1.6 4h5l-4.4 7.4 8.4-9.2h-4.6l3.4-2.2z' fill='%232ce8d2'/%3E%3C/svg%3E">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
-        <rect width="32" height="32" rx="7" fill="#0e1420"/>
-        <path d="M16 5l9 4v7c0 5.2-3.4 9.4-9 11-5.6-1.6-9-5.8-9-11V9l9-4z"
-              fill="none" stroke="#00e5a0" stroke-width="2"/>
-        <path d="M11.5 16.2l3 3 6-6.4" fill="none" stroke="#00e5a0"
-              stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <div class="brand-text">
-        <span class="brand-name">ResiliX</span>
-        <span class="brand-sub">Resilience Dashboard</span>
-      </div>
+
+<aside id="sidebar" class="sidebar">
+  <div class="sidebar-brand">
+    <img class="sidebar-logo" src="/assets/resilix-logo.png" alt="ResiliX" width="32" height="32">
+    <div class="sidebar-branding">
+      <div class="sidebar-title">RESILIX</div>
+      <div class="sidebar-subtitle">Operations Console</div>
     </div>
-    <div class="topbar-meta">
-      <span id="meta-version" class="meta-chip"></span>
-      <span id="meta-status" class="meta-chip status-chip"></span>
-      <span class="meta-chip local-chip" title="This dashboard is local-only">local-only</span>
+  </div>
+  <nav class="sidebar-nav">
+    <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span><span class="nav-label">Overview</span></button>
+    <button class="nav-item" data-view="new-test"><span class="nav-icon">＋</span><span class="nav-label">New Test</span></button>
+    <button class="nav-item" data-view="tests"><span class="nav-icon">◎</span><span class="nav-label">Tests</span></button>
+    <button class="nav-item" data-view="findings"><span class="nav-icon">◇</span><span class="nav-label">Findings</span></button>
+    <button class="nav-item" data-view="live"><span class="nav-icon">◉</span><span class="nav-label">Live Feed</span></button>
+    <button class="nav-item" data-view="reports"><span class="nav-icon">▣</span><span class="nav-label">Reports</span></button>
+    <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></button>
+  </nav>
+  <div class="sidebar-footer"><span class="sidebar-version">v2.0.0</span></div>
+</aside>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <input type="text" id="search-input" class="search-box" placeholder="Search tests, findings, reports..." autocomplete="off">
+  </div>
+  <div class="topbar-right">
+    <div id="status-indicator" class="status-indicator">
+      <span class="status-dot idle"></span>
+      <span class="status-text">IDLE</span>
     </div>
-  </header>
+    <button id="new-test-btn" class="btn btn-primary" data-view="new-test">+ NEW TEST</button>
+  </div>
+</header>
 
-  <main id="main" class="main">
-    <section id="state-error" class="state-panel hidden">
-      <h2>Report unavailable</h2>
-      <p id="error-message" class="error-message"></p>
-      <p class="hint">Start the dashboard against a saved test result:<br>
-        <code>python -m resilix.cli.main dashboard --report results/latest.json</code></p>
-    </section>
+<main id="main" class="main">
+  <section id="view-overview" class="view"></section>
+  <section id="view-new-test" class="view hidden"></section>
+  <section id="view-tests" class="view hidden"></section>
+  <section id="view-test-detail" class="view hidden"></section>
+  <section id="view-findings" class="view hidden"></section>
+  <section id="view-live" class="view hidden"></section>
+  <section id="view-reports" class="view hidden"></section>
+  <section id="view-settings" class="view hidden"></section>
+</main>
 
-    <section id="state-empty" class="state-panel hidden">
-      <h2>Insufficient data</h2>
-      <p>This report does not contain enough recorded data to visualize.</p>
-    </section>
-
-    <div id="dashboard" class="hidden">
-      <section id="report-header" class="report-header">
-        <div class="report-title-row">
-          <h1 id="test-target" class="report-title"></h1>
-          <span id="test-status" class="status-badge"></span>
-        </div>
-        <p id="test-subtitle" class="report-subtitle"></p>
-        <div id="test-phases" class="phase-row"></div>
-      </section>
-
-      <section class="kpi-grid" id="kpi-grid">
-        <article class="kpi kpi-score">
-          <h3>Resilience Score</h3>
-          <div class="kpi-value-row">
-            <span id="kpi-score" class="kpi-value"></span>
-            <span id="kpi-score-max" class="kpi-max"></span>
-          </div>
-          <div class="gauge"><div id="kpi-score-bar" class="gauge-fill"></div></div>
-          <p id="kpi-assessment" class="kpi-note"></p>
-        </article>
-        <article class="kpi">
-          <h3>Availability</h3>
-          <span id="kpi-availability" class="kpi-value"></span>
-          <p id="kpi-operations" class="kpi-note"></p>
-        </article>
-        <article class="kpi">
-          <h3>Peak p95 Latency</h3>
-          <span id="kpi-p95" class="kpi-value"></span>
-          <p id="kpi-p95-change" class="kpi-note"></p>
-        </article>
-        <article class="kpi">
-          <h3>Throughput</h3>
-          <span id="kpi-throughput" class="kpi-value"></span>
-          <p id="kpi-throughput-change" class="kpi-note"></p>
-        </article>
-        <article class="kpi">
-          <h3>Peak Error Rate</h3>
-          <span id="kpi-errors" class="kpi-value"></span>
-          <p id="kpi-error-detail" class="kpi-note"></p>
-        </article>
-        <article class="kpi">
-          <h3>Recovery</h3>
-          <span id="kpi-recovery" class="kpi-value"></span>
-          <p id="kpi-recovery-note" class="kpi-note"></p>
-        </article>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Time Series</h2>
-          <div class="metric-toggle" id="series-toggle" role="tablist" aria-label="Chart metric"></div>
-        </div>
-        <div id="series-empty" class="series-empty hidden">
-          <p>Insufficient time-series data — this result recorded fewer than
-             two metric samples, so no chart can be drawn.</p>
-        </div>
-        <figure id="series-figure" class="chart-figure">
-          <svg id="series-chart" viewBox="0 0 900 300" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Metric time series chart"></svg>
-          <figcaption id="series-caption" class="chart-caption"></figcaption>
-        </figure>
-      </section>
-
-      <div class="panel-grid">
-        <section class="panel">
-          <h2>Score Components</h2>
-          <ul id="score-components" class="score-list"></ul>
-          <p id="score-summary" class="score-summary"></p>
-        </section>
-
-        <section class="panel">
-          <h2>Recovery</h2>
-          <div id="recovery-body"></div>
-        </section>
-      </div>
-
-      <div class="panel-grid">
-        <section class="panel">
-          <h2>Baseline vs Peak</h2>
-          <div id="comparison-body"></div>
-        </section>
-
-        <section class="panel">
-          <h2>Safety Envelope</h2>
-          <div id="safety-body"></div>
-        </section>
-      </div>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Degradation Events <span id="degradation-count" class="count-chip"></span></h2>
-        </div>
-        <div id="degradation-body"></div>
-      </section>
-
-      <section class="panel">
-        <h2>Recommendations <span id="recommendations-count" class="count-chip"></span></h2>
-        <div id="recommendations-body"></div>
-      </section>
-
-      <footer class="footer">
-        <p id="footer-meta"></p>
-        <p class="footer-note">Passive view of a saved test result — the dashboard never
-           runs tests or sends traffic. All analysis is computed by the existing
-           ResiliX reporting layer.</p>
-      </footer>
-    </div>
-  </main>
-
-  <script src="/app.js"></script>
+<script src="/app.js"></script>
 </body>
 </html>

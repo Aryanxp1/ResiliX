@@ -19,12 +19,16 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlsplit
 
+from resilix import __version__
+
+from .console import ConsoleError, ConsoleManager
 from .dashboard import dashboard_error_payload, load_dashboard
 
 __all__ = [
@@ -42,11 +46,59 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Fixed whitelist: route -> (file inside STATIC_DIR, content type).
 # Anything not listed here (including anything that looks like a path
 # traversal) returns 404 — no directory listing, no arbitrary file access.
+# Note: the banner reference image is deliberately NOT served; the browser
+# only receives the page, its code and the brand logo.
 _STATIC_ROUTES: Dict[str, Any] = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/styles.css": ("styles.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/assets/resilix-logo.png": ("assets/resilix-logo.png", "image/png"),
+}
+
+# ---------------------------------------------------------------------------
+# Console API routes (local control plane). All input is untrusted: bodies
+# are size-capped, strictly parsed JSON, and every route delegates to
+# ConsoleManager which re-validates through the existing SafetyManager.
+# ---------------------------------------------------------------------------
+_MAX_BODY_BYTES = 16_384
+
+ConsoleFn = Callable[..., Any]
+
+_GET_ROUTES: List[Tuple[str, ConsoleFn]] = [
+    (r"^/api/console/state$",
+     lambda api, m, q: api.state()),
+    (r"^/api/console/overview$",
+     lambda api, m, q: api.overview()),
+    (r"^/api/console/tests$",
+     lambda api, m, q: api.list_tests(query=q.get("q", ""))),
+    (r"^/api/console/tests/([^/]+)/findings$",
+     lambda api, m, q: api.test_findings(m[0])),
+    (r"^/api/console/tests/([^/]+)/events$",
+     lambda api, m, q: {
+         "test_id": m[0], "events": api.test_detail(m[0])["events"]}),
+    (r"^/api/console/tests/([^/]+)/config$",
+     lambda api, m, q: {"test_id": m[0],
+                        "config": api.test_detail(m[0])["config"]}),
+    (r"^/api/console/tests/([^/]+)$",
+     lambda api, m, q: api.test_detail(m[0])),
+    (r"^/api/console/findings$",
+     lambda api, m, q: api.findings(severity=q.get("severity", ""))),
+    (r"^/api/console/live$",
+     lambda api, m, q: api.live()),
+    (r"^/api/console/settings$",
+     lambda api, m, q: api.settings()),
+    (r"^/api/console/search$",
+     lambda api, m, q: api.search(query=q.get("q", ""))),
+]
+
+_POST_ROUTES: Dict[str, Tuple[ConsoleFn, bool]] = {
+    # route -> (callable(payload), needs_payload)
+    "/api/console/validate": (lambda api, p: api.validate(p), True),
+    "/api/console/start": (lambda api, p: api.start(p), True),
+    "/api/console/stop": (lambda api, p: api.stop(emergency=False), False),
+    "/api/console/emergency-stop": (
+        lambda api, p: api.stop(emergency=True), False),
 }
 
 
@@ -85,6 +137,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             self._send(200, self.server.dashboard_data,  # type: ignore[attr-defined]
                        "application/json; charset=utf-8")
             return
+        if route.startswith("/api/console/"):
+            self._handle_console_get(route)
+            return
         entry = _STATIC_ROUTES.get(route)
         if entry is None:
             self._send(404, b'{"ok": false, "error": "Not found"}',
@@ -92,7 +147,14 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             return
         filename, content_type = entry
         try:
-            body = (STATIC_DIR / filename).read_bytes()
+            file_path = (STATIC_DIR / filename).resolve()
+            # Defense-in-depth: the whitelist is fixed, but never serve
+            # anything that resolves outside the static directory.
+            if not file_path.is_relative_to(STATIC_DIR.resolve()):
+                self._send(404, b'{"ok": false, "error": "Not found"}',
+                           "application/json; charset=utf-8")
+                return
+            body = file_path.read_bytes()
         except OSError:
             body = b"Dashboard asset missing."
             self._send(500, body, "text/plain; charset=utf-8")
@@ -101,6 +163,112 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib naming
         self.do_GET()
+
+    # -- console API ----------------------------------------------------------
+    def _console(self) -> ConsoleManager:
+        return self.server.console  # type: ignore[attr-defined]
+
+    def _handle_console_get(self, route: str) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        flat = {k: v[0] for k, v in query.items()}
+        api = self._console()
+
+        # Report export: existing reporting-layer output as a download.
+        report_match = re.match(r"^/api/console/tests/([^/]+)/report$", route)
+        if report_match:
+            self._send_report(report_match.group(1), flat.get("fmt", "json"))
+            return
+
+        for pattern, fn in _GET_ROUTES:
+            match = re.match(pattern, route)
+            if not match:
+                continue
+            try:
+                payload = fn(api, match.groups(), flat)
+            except ConsoleError as exc:
+                self._send_json(exc.status,
+                                {"ok": False, "error": exc.message})
+                return
+            self._send_json(200, payload)
+            return
+        self._send_json(404, {"ok": False, "error": "Not found"})
+
+    def _send_report(self, test_id: str, fmt: str) -> None:
+        try:
+            body, mimetype, ext = self._console().report(test_id, fmt)
+        except ConsoleError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.message})
+            return
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", test_id)[:64]
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(200)
+        self.send_header("Content-Type", mimetype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="resilix-{safe_id}.{ext}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        route = urlsplit(self.path).path or "/"
+        entry = _POST_ROUTES.get(route)
+        if entry is None:
+            if route.startswith("/api/console/"):
+                self._send_json(404, {"ok": False, "error": "Not found"})
+            else:
+                self._reject()
+            return
+        fn, needs_payload = entry
+
+        payload: Any = None
+        if needs_payload:
+            try:
+                payload = self._read_json_body()
+            except ConsoleError as exc:
+                self._send_json(exc.status,
+                                {"ok": False, "error": exc.message})
+                return
+            except ValueError:
+                self._send_json(
+                    400, {"ok": False,
+                          "error": "Request body must be valid JSON."})
+                return
+
+        try:
+            result = fn(self._console(), payload)
+        except ConsoleError as exc:
+            self._send_json(exc.status, {"ok": False, "error": exc.message})
+            return
+        except Exception:  # noqa: BLE001 - never leak internals/tracebacks
+            self._send_json(
+                500, {"ok": False, "error": "Internal console error."})
+            return
+        response = dict(result) if isinstance(result, dict) else {}
+        response["ok"] = True
+        self._send_json(200, response)
+
+    def _read_json_body(self) -> Any:
+        header = self.headers.get("Content-Length", "0")
+        try:
+            length = int(header)
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length <= 0:
+            raise ValueError("Empty request body")
+        if length > _MAX_BODY_BYTES:
+            raise ConsoleError(413, "Request body too large.")
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Malformed JSON body") from exc
+
+    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send(status, body, "application/json; charset=utf-8")
 
     def _reject(self) -> None:
         self._send(405, b'{"ok": false, "error": "Method not allowed"}',
@@ -132,7 +300,7 @@ class _DashboardHandler(BaseHTTPRequestHandler):
 # Server
 # ---------------------------------------------------------------------------
 class DashboardServer:
-    """Local-only HTTP server for the ResiliX dashboard.
+    """Local-only HTTP server for the ResiliX operations console.
 
     Parameters
     ----------
@@ -144,10 +312,15 @@ class DashboardServer:
         Bind address. Must be a loopback address (default ``127.0.0.1``).
     port:
         Bind port (default ``8765``).
+    workspace_dir:
+        Directory for console-saved test results (default ``results/``
+        relative to the current directory). The console control plane
+        (``/api/console/*``) stores runs here and lists them from here.
     """
 
     def __init__(self, report_path: Any = None,
-                 host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+                 host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 workspace_dir: Any = None) -> None:
         if not is_loopback_host(host):
             raise ValueError(
                 f"Refusing to bind dashboard to non-loopback address "
@@ -169,11 +342,16 @@ class DashboardServer:
         self._data_json = json.dumps(
             self.data, ensure_ascii=False, indent=2).encode("utf-8")
 
+        self.console = ConsoleManager(
+            workspace_dir if workspace_dir is not None else Path("results"),
+            version=__version__)
+
         self.host = host
         self._httpd = ThreadingHTTPServer((host, port), _DashboardHandler)
         # The actual bound port (useful when constructed with port 0 in tests).
         self.port = int(self._httpd.server_address[1])
         self._httpd.dashboard_data = self._data_json  # type: ignore[attr-defined]
+        self._httpd.console = self.console  # type: ignore[attr-defined]
         self._thread: Optional[threading.Thread] = None
         self._serving = False
 
