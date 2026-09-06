@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -56,9 +57,11 @@ from ..analysis import (
     ThresholdConfig,
     compute_resilience_score,
 )
+# Version source of truth: the package __init__.py (never hardcode a second copy).
+from .. import __version__ as _PACKAGE_VERSION
 
 BANNER = "RESILIX"
-TAGLINE = "Controlled Resilience Testing"
+PLATFORM_TAGLINE = "Controlled Cyber Resilience Testing Platform"
 RULE = "=" * 42
 ENGINE_CHOICES = [e.value for e in EngineType]
 
@@ -90,16 +93,132 @@ class _SilentLogger(StructuredLogger):
 
 
 # ---------------------------------------------------------------------------
+# Terminal capability detection (Windows PowerShell / CMD safe)
+# ---------------------------------------------------------------------------
+
+# Lazy capability cache: probe the terminal at most once per run.
+_TERM: Dict[str, Optional[bool]] = {"color": None, "unicode": None}
+
+
+def _init_terminal() -> None:
+    """Enable ANSI VT processing on Windows consoles when available.
+
+    Safe no-op on non-Windows platforms and on consoles that do not support
+    VT mode — output simply degrades to plain, uncolored text.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (-11, -12):  # stdout, stderr
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_ulong()
+            if handle and kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:  # noqa: BLE001 - optional enhancement only
+        pass
+
+
+def _terminal_supports_unicode() -> bool:
+    """True when box-drawing glyphs will render correctly on this stream."""
+    if _TERM["unicode"] is None:
+        term_env = os.environ.get("TERM", "")
+        encoding = (sys.stdout.encoding or "").replace("-", "").lower()
+        _TERM["unicode"] = bool(
+            term_env != "dumb"
+            and (encoding.startswith("utf") or encoding == "cp65001")
+        )
+    return _TERM["unicode"]
+
+
+def _use_color() -> bool:
+    """Graceful color support (honors NO_COLOR, TERM=dumb, piped output)."""
+    if _TERM["color"] is None:
+        color = True
+        if os.environ.get("NO_COLOR"):
+            color = False
+        elif os.environ.get("TERM") == "dumb":
+            color = False
+        elif not sys.stdout.isatty():
+            color = False
+        _TERM["color"] = color
+    return _TERM["color"]
+
+
+def _style(text: str, *codes: int, enabled: Optional[bool] = None) -> str:
+    """Apply ANSI SGR *codes* to *text* when color is on, else plain text."""
+    if enabled is None:
+        enabled = _use_color()
+    if not enabled or not codes:
+        return text
+    return f"\x1b[{';'.join(str(c) for c in codes)}m{text}\x1b[0m"
+
+
+def _release_status() -> str:
+    """Derive RELEASE / DEVELOPMENT status from the package version string."""
+    version = _PACKAGE_VERSION.lower()
+    if any(mark in version for mark in ("dev", "alpha", "beta", "rc", "pre")):
+        return "DEVELOPMENT"
+    return "RELEASE"
+
+
+# ---------------------------------------------------------------------------
 # Presentation helpers
 # ---------------------------------------------------------------------------
 def _print_banner() -> None:
-    print(BANNER)
-    print(TAGLINE)
-    print(RULE)
+    """Render the ResiliX startup banner (terminal-safe Unicode/ASCII box)."""
+    if _terminal_supports_unicode():
+        tl, tr, bl, br, hbar, vbar = "╔", "╗", "╚", "╝", "═", "║"
+    else:
+        tl, tr, bl, br, hbar, vbar = "+", "+", "+", "+", "-", "|"
+    width, body = 56, 52
+    inner = [
+        "",
+        "R E S I L I X",
+        "",
+        PLATFORM_TAGLINE,
+        "",
+        f"v{_PACKAGE_VERSION}   |   {_release_status()}",
+        "",
+    ]
+    print()
+    print(tl + hbar * (width - 2) + tr)
+    for line in inner:
+        print(vbar + " " + line.center(body) + " " + vbar)
+    print(bl + hbar * (width - 2) + br)
+    print()
 
 
 def _kv(label: str, value: Any) -> None:
     print(f"{label:<14} {value}")
+
+
+def _safety_status_text(config: TestConfig) -> str:
+    """Safety status rendered from the actual SafetyConfig guards.
+
+    The CLI always routes every run through the existing SafetyManager; this
+    text reflects the real guard flags (target allowlist + emergency stop).
+    """
+    safety = config.safety
+    guards = {
+        "target allowlist": bool(getattr(safety, "require_authorized_target", True)),
+        "emergency stop": bool(getattr(safety, "allow_emergency_stop", True)),
+    }
+    if all(guards.values()):
+        return _style("ENABLED", 32, 1)
+    degraded = ", ".join(name for name, on in guards.items() if not on)
+    return _style(f"LIMITED ({degraded})", 33, 1)
+
+
+def _progress_bar(fraction: float, width: int = 20) -> str:
+    """Fill-style progress bar (Unicode blocks with a safe ASCII fallback)."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled = int(round(fraction * width))
+    if _terminal_supports_unicode():
+        return "█" * filled + "░" * (width - filled)
+    return "#" * filled + "-" * (width - filled)
 
 # ---------------------------------------------------------------------------
 # Argument value validators (clean argparse errors, no tracebacks)
@@ -335,15 +454,22 @@ def _save_output(args: argparse.Namespace, data: Any) -> None:
         _warn(f"Could not write output file '{path}': {exc}")
 
 
-def _print_test_header(config: TestConfig) -> None:
+def _print_status_panel(config: TestConfig) -> None:
+    """Compact pre-flight status section (platform, engine, safety, load)."""
     print(RULE)
-    _kv("Target", str(config.target))
-    _kv("Engine", config.engine.value.upper())
-    _kv("Scenario", config.scenario.name)
-    _kv("Phases", len(config.scenario.phases))
-    _kv("Max rate", f"{config.scenario.max_rate:g} req/s")
-    _kv("Concurrency", config.scenario.concurrency)
-    _kv("Duration", f"{config.scenario.total_duration:.0f}s")
+    panel = [
+        ("Platform", f"{BANNER} v{_PACKAGE_VERSION}"),
+        ("Engine", config.engine.value.upper()),
+        ("Safety", _safety_status_text(config)),
+        ("Max Rate", f"{config.scenario.max_rate:g} req/s"),
+        ("Concurrency", config.scenario.concurrency),
+        ("Target", str(config.target)),
+        ("Scenario", config.scenario.name),
+        ("Phases", str(len(config.scenario.phases))),
+        ("Duration", f"{config.scenario.total_duration:.0f}s"),
+    ]
+    for label, value in panel:
+        _kv(label, value)
     print(RULE)
 
 
@@ -355,24 +481,28 @@ def _status_block(config: TestConfig, engine, elapsed: float) -> List[str]:
     snap = engine.collect_metrics()
     total = len(config.scenario.phases)
     idx = 0
+    phase_name = snap.phase or ""
     for i, phase in enumerate(config.scenario.phases, start=1):
         if phase.name == snap.phase:
             idx = i
             break
+    total_duration = max(0.0, config.scenario.total_duration)
+    progress = (elapsed / total_duration) if total_duration > 0 else 0.0
+    progress = min(1.0, progress)
+    errors = int(snap.failures)
+    error_style = (31, 1) if errors else ()
     lines = [
-        "Target       " + str(config.target),
-        "Engine       " + config.engine.value.upper(),
-        "Scenario     " + config.scenario.name,
-        "Status       RUNNING",
         "",
-        f"Requests     {snap.requests}",
-        f"Success      {snap.successes}",
-        f"Errors       {snap.failures}",
-        f"Rate         {snap.rate_per_sec:.0f} req/s",
-        f"p95 Latency  {snap.p95_ms:.0f} ms",
+        f"  Phase       {phase_name or '(preparing)'}  ({idx}/{total})",
+        f"  Elapsed     {_fmt_elapsed(elapsed)} / {_fmt_elapsed(total_duration)}",
+        f"  Progress    {_progress_bar(progress)} {progress * 100:3.0f}%",
+        f"  Safety      {_safety_status_text(config)}",
         "",
-        f"Phase        {idx}/{total}",
-        f"Elapsed      {_fmt_elapsed(elapsed)}",
+        f"  Requests    {snap.requests}",
+        f"  Successes   {snap.successes}",
+        f"  Errors      {_style(str(errors), *error_style)}",
+        f"  Rate        {snap.rate_per_sec:.0f} req/s",
+        f"  p95         {snap.p95_ms:.0f} ms",
     ]
     return lines
 
@@ -406,7 +536,7 @@ def _cmd_test(args: argparse.Namespace) -> int:
             holder["error"] = exc
 
     _print_banner()
-    _print_test_header(config)
+    _print_status_panel(config)
     print("Starting controlled resilience test...")
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -424,14 +554,14 @@ def _cmd_test(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         if tty and last_lines:
             sys.stdout.write(f"\x1b[{last_lines}A\x1b[0J")
-        print("\nCtrl+C received — triggering emergency stop...")
+        print("\n" + _style("Ctrl+C received — triggering emergency stop...", 33))
         try:
             config.safety.emergency_stop.trigger()
         except Exception:  # noqa: BLE001
             pass
         engine.stop()
         thread.join(timeout=10)
-        print("Test aborted by user.")
+        print(_style("Test aborted by user.", 33, 1))
         _save_output(args, holder.get("result"))
         return 130
 
@@ -449,42 +579,54 @@ def _cmd_test(args: argparse.Namespace) -> int:
 # Final result rendering
 # ---------------------------------------------------------------------------
 def _render_final(result) -> None:
+    peak = result.peak_metrics
+    done = peak.successes + peak.failures
+    availability = (peak.successes / done) * 100.0 if done else 0.0
+    status_text = result.status.value.upper()
+    status_color = (32, 1) if status_text == "COMPLETED" else (33, 1)
+
     print()
-    print("RESILIENCE TEST COMPLETE")
+    print(_style("RESILIENCE TEST COMPLETE", 36, 1))
     print(RULE)
     _kv("Test ID", result.test_id)
-    _kv("Engine", result.engine.value.upper())
+    _kv("Status", _style(status_text, *status_color))
     _kv("Target", result.target)
     _kv("Scenario", result.scenario_name)
     _kv("Duration", f"{result.duration_sec:.1f}s")
-    _kv("Status", result.status.value.upper())
     print("-" * 42)
-
-    _kv("Resilience Score", f"{result.resilience.total:.1f} / 100")
-    _kv("Peak Error Rate", f"{result.peak_metrics.error_rate:g}%")
-    _kv("Peak p95 Latency", f"{result.peak_metrics.p95_ms:g} ms")
+    _kv("Operations", peak.requests)
+    _kv("Successes", peak.successes)
+    _kv("Failures", _style(str(peak.failures), 31, 1) if peak.failures else "0")
+    _kv("Availability", f"{availability:.1f}%")
+    _kv("Peak Error Rate", f"{peak.error_rate:g}%")
+    _kv("Peak p95 Latency", f"{peak.p95_ms:g} ms")
     recovery = result.recovery
     if recovery.recovery_time_sec is not None:
         _kv("Recovery Time", f"{recovery.recovery_time_sec:.1f}s")
     else:
         _kv("Recovery Time", "n/a")
-    total = result.peak_metrics.successes + result.peak_metrics.failures
-    availability = (result.peak_metrics.successes / total) if total else 0.0
-    _kv("Availability", f"{availability * 100:.1f}%")
-    _kv("Operations", result.peak_metrics.requests)
 
     if result.resilience.components:
         print("-" * 42)
-        print("Score components")
+        print(_style("RESILIENCE SCORE", 36, 1))
         for comp in result.resilience.components:
-            print(f"  {comp.name:<22} {comp.earned:5.1f} / {comp.maximum:g}")
+            print(f"  {comp.name:<24} {comp.earned:5.1f} / {comp.maximum:g}")
+        print(f"  {'Total':<24} {result.resilience.total:5.1f} / "
+              f"{result.resilience.maximum:g}")
 
     events = result.degradation_events or []
     if events:
         print("-" * 42)
         print(f"Degradation events ({len(events)})")
         for ev in events[:8]:
-            print(f"  [{ev.severity.value.upper():<8}] {ev.message}")
+            sev = ev.severity.value.upper()
+            if ev.severity.value == "critical":
+                tag = _style(f"[{sev:<8}]", 31, 1)
+            elif ev.severity.value == "warning":
+                tag = _style(f"[{sev:<8}]", 33)
+            else:
+                tag = f"[{sev:<8}]"
+            print(f"  {tag} {ev.message}")
 
     try:
         recs = RecommendationEngine().generate(
@@ -503,7 +645,7 @@ def _render_final(result) -> None:
 
 def _render_baseline(baseline: BaselineMetrics, snap: MetricSnapshot) -> None:
     print()
-    print("BASELINE MEASURED")
+    print(_style("BASELINE MEASURED", 36, 1))
     print(RULE)
     _kv("Operations", baseline.operations)
     _kv("Rate", f"{baseline.rate_per_sec:g} req/s")
@@ -527,7 +669,7 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     engine = _create_engine(config, silent)
 
     _print_banner()
-    _print_test_header(config)
+    _print_status_panel(config)
     print("Measuring baseline...")
     try:
         engine.reset()
@@ -656,27 +798,42 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     except AttributeError:  # missing _from_event in older platform
         recs = []
     print()
-    print("ANALYSIS RESULTS")
+    print(_style("ANALYSIS RESULTS", 36, 1))
     print(RULE)
+    _kv("Platform", f"{BANNER} v{_PACKAGE_VERSION}")
     _kv("Test ID", result.test_id)
     _kv("Engine", result.engine.value.upper())
     _kv("Target", result.target)
     _kv("Scenario", result.scenario_name)
     print("-" * 42)
-    _kv("Resilience Score", f"{score.total:.1f} / 100")
+    done = peak.successes + peak.failures
+    availability = (peak.successes / done) * 100.0 if done else 0.0
+    _kv("Operations", peak.requests)
+    _kv("Successes", peak.successes)
+    _kv("Failures", peak.failures)
+    _kv("Availability", f"{availability:.1f}%")
+    _kv("Resilience Score", f"{score.total:.1f} / {score.maximum:g}")
     _kv("Peak Error Rate", f"{peak.error_rate:g}%")
     _kv("Peak p95 Latency", f"{peak.p95_ms:g} ms")
     if recovery.recovery_time_sec is not None:
         _kv("Recovery Time", f"{recovery.recovery_time_sec:.1f}s")
     print("-" * 42)
-    print("Score components")
+    print(_style("RESILIENCE SCORE", 36, 1))
     for comp in score.components:
-        print(f"  {comp.name:<22} {comp.earned:5.1f} / {comp.maximum:g}")
+        print(f"  {comp.name:<24} {comp.earned:5.1f} / {comp.maximum:g}")
+    print(f"  {'Total':<24} {score.total:5.1f} / {score.maximum:g}")
     if events:
         print("-" * 42)
         print(f"Degradation events ({len(events)})")
         for ev in events[:8]:
-            print(f"  [{ev.severity.value.upper():<8}] {ev.message}")
+            sev = ev.severity.value.upper()
+            if ev.severity.value == "critical":
+                tag = _style(f"[{sev:<8}]", 31, 1)
+            elif ev.severity.value == "warning":
+                tag = _style(f"[{sev:<8}]", 33)
+            else:
+                tag = f"[{sev:<8}]"
+            print(f"  {tag} {ev.message}")
     if recs:
         print("-" * 42)
         print("Recommendations")
@@ -706,13 +863,23 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="resilix",
-        description="ResiliX — controlled resilience testing for authorized "
-                    "local targets.",
+        description=(
+            f"{BANNER} — {PLATFORM_TAGLINE}\n"
+            "\n"
+            "Commands:\n"
+            "  test      Run a full resilience test (baseline + scenario + scoring)\n"
+            "            against an authorized target.\n"
+            "  baseline  Run a controlled baseline measurement only.\n"
+            "  analyze   Analyze a previously saved test result (JSON).\n"
+            "\n"
+            "All runs are governed by the central safety layer: target allowlist, hard\n"
+            "rate/concurrency/duration limits, and a global emergency stop (Ctrl+C).\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "--version", action="version",
-        version="%(prog)s 2.0.0",
+        version=f"%(prog)s {_PACKAGE_VERSION}",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -849,6 +1016,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for ``python -m resilix.cli.main``."""
+    _init_terminal()  # best-effort VT processing on Windows consoles
     parser = _build_parser()
     args = parser.parse_args(argv)
 
