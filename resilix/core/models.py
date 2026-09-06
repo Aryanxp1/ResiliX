@@ -122,61 +122,81 @@ class Scenario:
         )
 
     @classmethod
-    def sustained_load(cls, rate: float = 150.0, concurrency: int = 20) -> "Scenario":
+    def sustained_load(cls, start_rate: Optional[float] = None,
+                       max_rate: Optional[float] = None,
+                       concurrency: int = 20) -> "Scenario":
+        if max_rate is None:
+            max_rate = 150.0
+        if start_rate is None:
+            start_rate = max_rate * 0.3
         return cls(
             name="sustained-load",
             description="Constant moderate load for an extended period.",
-            start_rate=rate * 0.3,
-            max_rate=rate,
+            start_rate=start_rate,
+            max_rate=max_rate,
             concurrency=concurrency,
             phases=[
-                ScenarioPhase("baseline", 5, rate * 0.2, concurrency, "baseline"),
-                ScenarioPhase("ramp-up", 10, rate, concurrency, "ramp-up"),
-                ScenarioPhase("sustained-load", 30, rate, concurrency, "load"),
-                ScenarioPhase("cooldown", 10, rate * 0.3, concurrency, "cooldown"),
-                ScenarioPhase("recovery", 15, rate * 0.2, concurrency, "recovery"),
+                ScenarioPhase("baseline", 5, max_rate * 0.2, concurrency, "baseline"),
+                ScenarioPhase("ramp-up", 10, max_rate, concurrency, "ramp-up"),
+                ScenarioPhase("sustained-load", 30, max_rate, concurrency, "load"),
+                ScenarioPhase("cooldown", 10, max_rate * 0.3, concurrency, "cooldown"),
+                ScenarioPhase("recovery", 15, max_rate * 0.2, concurrency, "recovery"),
             ],
         )
 
     @classmethod
-    def spike(cls, rate: float = 300.0, concurrency: int = 30) -> "Scenario":
+    def spike(cls, start_rate: Optional[float] = None,
+              max_rate: Optional[float] = None,
+              concurrency: int = 30) -> "Scenario":
+        if max_rate is None:
+            max_rate = 300.0
+        if start_rate is None:
+            start_rate = max_rate * 0.2
         return cls(
             name="spike",
             description="Short high-load spikes interleaved with calm periods.",
-            start_rate=rate * 0.2,
-            max_rate=rate,
+            start_rate=start_rate,
+            max_rate=max_rate,
             concurrency=concurrency,
             phases=[
-                ScenarioPhase("baseline", 5, rate * 0.2, concurrency, "baseline"),
-                ScenarioPhase("spike", 8, rate, concurrency, "spike"),
-                ScenarioPhase("calm", 8, rate * 0.2, concurrency, "cooldown"),
-                ScenarioPhase("spike", 8, rate, concurrency, "spike"),
-                ScenarioPhase("recovery", 15, rate * 0.2, concurrency, "recovery"),
+                ScenarioPhase("baseline", 5, max_rate * 0.2, concurrency, "baseline"),
+                ScenarioPhase("spike", 8, max_rate, concurrency, "spike"),
+                ScenarioPhase("calm", 8, max_rate * 0.2, concurrency, "cooldown"),
+                ScenarioPhase("spike", 8, max_rate, concurrency, "spike"),
+                ScenarioPhase("recovery", 15, max_rate * 0.2, concurrency, "recovery"),
             ],
         )
 
     @classmethod
-    def recovery(cls, rate: float = 150.0, concurrency: int = 20) -> "Scenario":
+    def recovery(cls, start_rate: Optional[float] = None,
+                 max_rate: Optional[float] = None,
+                 concurrency: int = 20) -> "Scenario":
+        if max_rate is None:
+            max_rate = 150.0
+        if start_rate is None:
+            start_rate = max_rate * 0.3
         return cls(
             name="recovery",
             description="Load that returns to baseline to measure recovery time.",
-            start_rate=rate * 0.3,
-            max_rate=rate,
+            start_rate=start_rate,
+            max_rate=max_rate,
             concurrency=concurrency,
             phases=[
-                ScenarioPhase("baseline", 5, rate * 0.2, concurrency, "baseline"),
-                ScenarioPhase("ramp-up", 10, rate, concurrency, "ramp-up"),
-                ScenarioPhase("high-load", 15, rate, concurrency, "load"),
+                ScenarioPhase("baseline", 5, max_rate * 0.2, concurrency, "baseline"),
+                ScenarioPhase("ramp-up", 10, max_rate, concurrency, "ramp-up"),
+                ScenarioPhase("high-load", 15, max_rate, concurrency, "load"),
                 ScenarioPhase("stop-load", 1, 0.0, concurrency, "cooldown"),
-                ScenarioPhase("recovery", 20, rate * 0.2, concurrency, "recovery"),
+                ScenarioPhase("recovery", 20, max_rate * 0.2, concurrency, "recovery"),
             ],
         )
 
     @classmethod
     def custom(cls, name: str, phases: List[ScenarioPhase],
+               description: str = "",
                start_rate: float = 10.0, max_rate: float = 200.0,
                concurrency: int = 20, mix: Optional[Dict[str, float]] = None) -> "Scenario":
-        return cls(name=name, start_rate=start_rate, max_rate=max_rate,
+        return cls(name=name, description=description,
+                   start_rate=start_rate, max_rate=max_rate,
                    concurrency=concurrency, phases=phases,
                    mix=mix or {})
 

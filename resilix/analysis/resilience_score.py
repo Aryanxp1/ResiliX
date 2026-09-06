@@ -47,8 +47,10 @@ def score_latency_stability(
         return ScoreComponent("Latency stability", max_w, max_w,
                               "Baseline p95 unavailable; full credit.")
     p95_increase = (peak.p95_ms - baseline.p95_ms) / baseline.p95_ms
-    # score = max_w * max(0, 1 - p95_increase)
-    earned = max(0.0, max_w * (1.0 - min(p95_increase, 1.0)))
+    # score = max_w * max(0, 1 - p95_increase), capped at max_w so that
+    # latency improvements receive the full bonus without exceeding the
+    # component maximum.
+    earned = min(max_w, max(0.0, max_w * (1.0 - min(p95_increase, 1.0))))
     return ScoreComponent(
         "Latency stability", round(earned, 1), max_w,
         f"P95 increased {p95_increase*100:.1f}% over baseline.",
