@@ -216,6 +216,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         route = urlsplit(self.path).path or "/"
         entry = _POST_ROUTES.get(route)
         if entry is None:
+            # Consume the declared body BEFORE answering. Closing a socket
+            # with unread bytes pending sends a TCP RST on Windows (and
+            # desyncs keep-alive connections), either of which can destroy
+            # the error response the client is about to read.
+            self._drain_request_body()
             if route.startswith("/api/console/"):
                 self._send_json(404, {"ok": False, "error": "Not found"})
             else:
@@ -247,7 +252,9 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                 500, {"ok": False, "error": "Internal console error."})
             return
         response = dict(result) if isinstance(result, dict) else {}
-        response["ok"] = True
+        # Preserve the handler's own verdict (e.g. validate() reports
+        # ok=false for failed safety checks); only fill it in when absent.
+        response.setdefault("ok", True)
         self._send_json(200, response)
 
     def _read_json_body(self) -> Any:
@@ -266,6 +273,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("Malformed JSON body") from exc
 
+    def _drain_request_body(self) -> None:
+        """Read and discard a pending request body (error paths only).
+
+        Answering while the declared body is still unread closes the
+        connection out of sync: on Windows the pending bytes turn the
+        close into a TCP RST that can destroy the response, and on
+        keep-alive connections the leftover body is misparsed as the next
+        request line.
+        """
+        try:
+            remaining = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            remaining = 0
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 8192))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(status, body, "application/json; charset=utf-8")
@@ -274,7 +300,10 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         self._send(405, b'{"ok": false, "error": "Method not allowed"}',
                    "application/json; charset=utf-8")
 
-    do_POST = _reject
+    # NOTE: do_POST is the real dispatcher defined above. It must NOT be
+    # rebound here — a previous "do_POST = _reject" class-body assignment
+    # shadowed it, so every POST (including /api/console/validate) answered
+    # 405 "Method not allowed". Only non-POST write methods are rejected.
     do_PUT = _reject
     do_DELETE = _reject
     do_PATCH = _reject

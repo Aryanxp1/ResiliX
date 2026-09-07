@@ -592,7 +592,10 @@ class ConsoleManager:
 
     def test_findings(self, test_id: str) -> Dict[str, Any]:
         detail = self.test_detail(test_id)
-        events = detail["report"]["degradation"]["events"]
+        # NOTE: the report section is "degradation_analysis" (the original
+        # "degradation" key never existed and raised KeyError, breaking the
+        # /api/console/tests/<id>/findings route).
+        events = detail["report"]["degradation_analysis"]["events"]
         return {"test_id": detail["test_id"],
                 "findings": events, "count": len(events)}
 
@@ -604,11 +607,14 @@ class ConsoleManager:
                 result, report = self._load_public(path)
             except (ReportingError, OSError, ValueError):
                 continue
-            for ev in report["degradation"]["events"]:
+            for ev in report["degradation_analysis"]["events"]:
                 if wanted and ev["severity"].lower() != wanted:
                     continue
                 row = dict(ev)
                 row["test_id"] = result.test_id
+                # The findings workspace shows which target each finding
+                # belongs to (read from the same loaded result — no joins).
+                row["target"] = result.target
                 rows.append(row)
         return {"findings": rows, "count": len(rows),
                 "severities": sorted({

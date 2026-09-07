@@ -1,6 +1,7 @@
 """Tests for the local-only dashboard HTTP server."""
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -186,3 +187,140 @@ def test_asset_route_cannot_be_abused_for_traversal(server):
                   "assets/dashboard.py", "assets/", "assets"):
         status, _ = _get_error(server.url + route)
         assert status == 404, route
+
+
+# ---------------------------------------------------------------------------
+# Console POST routes over real HTTP
+# (Regression: a "do_POST = _reject" class-body assignment used to shadow
+# the real dispatcher, so EVERY POST answered 405 "Method not allowed".
+# These tests exercise the actual HTTP request path, not ConsoleManager.)
+# ---------------------------------------------------------------------------
+VALID_CONFIG = {
+    "target": "127.0.0.1:8080",
+    "engine": "http",
+    "scenario": "baseline",
+    "duration": 5,
+    "start_rate": 5,
+    "max_rate": 10,
+    "concurrency": 2,
+}
+
+
+def _post_json(url, payload):
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _post_raw(url, raw_body):
+    request = urllib.request.Request(
+        url, data=raw_body,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def test_post_console_validate_ok_over_http(server):
+    status, body = _post_json(server.url + "api/console/validate",
+                              VALID_CONFIG)
+    assert status == 200
+    assert body.startswith(b"{")  # JSON response
+    payload = json.loads(body)
+    # The handler must not clobber the backend verdict with ok=true.
+    assert payload["ok"] is True
+    by_name = {c["name"]: c for c in payload["checks"]}
+    assert by_name["Target format valid"]["ok"] is True
+    assert by_name["Target authorized"]["ok"] is True
+    assert "127.0.0.1" in by_name["Target authorized"]["detail"]
+    assert by_name["Scenario valid"]["ok"] is True
+    assert set(payload["limits"]) == {
+        "max_duration_sec", "max_rate_per_sec", "max_concurrency",
+        "max_total_operations", "max_payload_bytes", "max_connections",
+        "allow_emergency_stop", "require_authorized_target"}
+
+
+def test_post_console_validate_unauthorized_target_safety_response(server):
+    payload_req = dict(VALID_CONFIG, target="http://203.0.113.5/")
+    status, body = _post_json(server.url + "api/console/validate",
+                              payload_req)
+    # validate() is a safety REPORT: HTTP 200 with the backend's own
+    # ok=false verdict — the dispatcher must preserve it verbatim.
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["ok"] is False
+    by_name = {c["name"]: c for c in payload["checks"]}
+    assert by_name["Target authorized"]["ok"] is False
+    assert "203.0.113.5" in by_name["Target authorized"]["detail"]
+
+
+def test_post_console_validate_malformed_json_is_400(server):
+    status, body = _post_raw(server.url + "api/console/validate",
+                             b"this is not json")
+    assert status == 400
+    payload = json.loads(body)
+    assert payload["ok"] is False
+    assert "error" in payload
+
+
+def test_post_unknown_console_route_is_404(server):
+    status, body = _post_json(server.url + "api/console/definitely-not-real",
+                              {})
+    assert status == 404
+    assert json.loads(body)["ok"] is False
+
+
+def test_post_unknown_route_keeps_connection_in_sync(server):
+    # Keep-alive regression: an unmatched POST must consume its request
+    # body. If it answers with the body still unread, the leftover bytes
+    # are misparsed as the next request line and the follow-up GET on the
+    # SAME connection is destroyed (the old code also intermittently hit a
+    # TCP RST on Windows that killed the 404 response itself).
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+    try:
+        conn.request("POST", "/api/console/definitely-not-real",
+                     body=json.dumps({"target": "127.0.0.1:8080"}),
+                     headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        assert response.status == 404
+        assert json.loads(response.read())["ok"] is False
+
+        conn.request("GET", "/api/console/state")
+        response = conn.getresponse()
+        assert response.status == 200
+        payload = json.loads(response.read())
+        assert payload["schema_version"] == 1
+        assert payload["status"] == "idle"
+    finally:
+        conn.close()
+
+
+def test_put_console_validate_is_rejected_405(server):
+    # Bodyless write request (same convention as test_write_methods_rejected)
+    # — non-POST write methods stay rejected on console routes.
+    request = urllib.request.Request(
+        server.url + "api/console/validate", method="PUT")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status, body = response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        status, body = exc.code, exc.read()
+    assert status == 405
+    assert json.loads(body)["ok"] is False
+
+
+def test_get_console_state_still_works(server):
+    status, body = _get(server.url + "api/console/state")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["schema_version"] == 1
+    assert payload["status"] in ("idle", "running", "stopping", "completed",
+                                 "stopped", "emergency_stopped", "failed")
+    assert "active" in payload and "last_run_id" in payload

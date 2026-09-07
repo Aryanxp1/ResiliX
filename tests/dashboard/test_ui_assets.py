@@ -91,3 +91,53 @@ def test_app_js_fetches_local_api_only():
     assert "XMLHttpRequest" not in js
     assert "http://" not in js.replace("http://www.w3.org/2000/svg", "")
     assert "https://" not in js
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Test Detail / Findings / Events workspace invariants
+# ---------------------------------------------------------------------------
+def test_app_js_builds_test_detail_workspace_sections():
+    """The detail view must render the full workspace hierarchy from the
+    backend report (no client-side recomputation)."""
+    js = _read("app.js")
+    for section in ("Resilience Score", "Key Metrics", "Findings",
+                    "Recovery", "Configuration (read-only)",
+                    "Timeline / Events"):
+        assert section in js, f"missing detail section: {section}"
+    # Sections read the backend's report payload fields verbatim.
+    for field in ("resilience_score", "performance_metrics",
+                  "degradation_analysis", "recovery_analysis",
+                  "test_configuration", "final_assessment"):
+        assert field in js, f"detail must use backend field: {field}"
+
+
+def test_app_js_uses_detail_and_events_endpoints():
+    js = _read("app.js")
+    # Detail is fetched per test id from the console API (encoded).
+    assert '"/console/tests/"' in js
+    assert "encodeURIComponent" in js
+    assert '"/events"' in js
+    # Findings come from the findings endpoint, never computed client-side.
+    assert '"/console/findings"' in js
+
+
+def test_app_js_live_feed_offers_detail_after_terminal_state():
+    js = _read("app.js")
+    # Terminal detection + explicit (non-automatic) navigation action.
+    assert "last_run_id" in js
+    assert "VIEW TEST DETAILS" in js
+
+
+def test_styles_define_phase3_workspace_classes():
+    css = _read("styles.css")
+    for cls in (".score-hero", ".score-fill", ".timeline-item",
+                ".tests-toolbar", ".live-final", ".state-box"):
+        assert cls in css, f"missing workspace style: {cls}"
+
+
+def test_app_js_has_no_html_injection_or_dynamic_code_execution():
+    js = _read("app.js")
+    for forbidden in ("innerHTML", "outerHTML", "document.write", "eval(",
+                      "new Function", "setAttribute(\"onclick\""):
+        assert forbidden not in js, f"forbidden API: {forbidden}"
+
