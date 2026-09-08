@@ -160,13 +160,15 @@ class ConfigRequest:
 class ConsoleManager:
     """Owns console state and drives runs through the existing Controller."""
 
-    def __init__(self, workspace_dir: Any, version: str = "") -> None:
+    def __init__(self, workspace_dir: Any, version: str = "",
+                 local_only: bool = True) -> None:
         self._workspace = Path(workspace_dir)
         try:
             self._workspace.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass  # surfaced later via save errors, never crashes the server
         self._version = version
+        self._local_only = bool(local_only)
         self._lock = threading.RLock()
         self._status = ST_IDLE
         self._active: Optional[Dict[str, Any]] = None
@@ -639,6 +641,7 @@ class ConsoleManager:
             "safety": self._public_limits(safety),
             "engines": [e.value for e in EngineType],
             "scenarios": list_scenarios(),
+            "local_only": self._local_only,
             "lifecycle_states": [ST_IDLE, ST_RUNNING, ST_STOPPING,
                                  ST_COMPLETED, ST_STOPPED, ST_EMERGENCY,
                                  ST_FAILED],

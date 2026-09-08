@@ -111,6 +111,7 @@
           if (a === "emergency-stop") this.confirmEmergencyStop();
           if (a === "view-test") this.viewTestDetail(action.dataset.testId);
           if (a === "new-test-nav") this.render("new-test");
+          if (a === "navigate-tests") this.render("tests");
         }
       });
       const si = document.getElementById("search-input");
@@ -1180,6 +1181,7 @@
       const s = this.state.settings || {};
       const f = s.safety || {};
       const e = s.engines || [];
+      const sc = s.scenarios || [];
       const section = this.panel(v, "Safety Envelope");
       const table = this.ce("table", "settings-table", section);
       [["Emergency Stop", f.allow_emergency_stop ? "ENABLED" : "DISABLED"],
@@ -1206,15 +1208,174 @@
         this.ce("p", "empty-message", engineSection).textContent =
           "Engine availability unavailable (settings not loaded).";
       }
+      const scenarioSection = this.panel(v, "Available Scenarios");
+      const scenarioList = this.ce("ul", "engine-list", scenarioSection);
+      sc.forEach(name => {
+        const li = this.ce("li", null, scenarioList);
+        li.textContent = name;
+      });
+      if (sc.length === 0) {
+        this.ce("p", "empty-message", scenarioSection).textContent =
+          "Scenario list unavailable (settings not loaded).";
+      }
+      const serverSection = this.panel(v, "Server Mode");
+      const serverTable = this.ce("table", "settings-table", serverSection);
+      // The console is local-only by design (loopback binding enforced by
+      // the CLI). We surface this from the backend payload; the value comes
+      // from the server — it is never hardcoded here.
+      const isLocal = s.local_only === true;
+      [["Access", isLocal ? "Local / Loopback Only" : "Network (non-loopback)"],
+       ["Version", s.version || "N/A"]
+      ].forEach(([label, value]) => {
+        const row = this.ce("tr", null, serverTable);
+        this.ce("td", null, row).textContent = label;
+        const td = this.ce("td", "setting-value", row);
+        td.textContent = value;
+        if (label === "Access") {
+          td.className = isLocal
+            ? "setting-value settings-badge settings-badge-local"
+            : "setting-value settings-badge";
+        }
+      });
     },
 
     async performSearch(query) {
+      this._showSearchPanel("loading", query);
       try {
         const res = await api.search(query);
         this.state.searchResults = res;
+        this.renderSearchResults(res);
       } catch (e) {
         console.error("Search error:", e);
+        this._showSearchPanel("error", query);
       }
+    },
+
+    // Build a simple transient search panel for loading / no-results / error.
+    // Results panel is built by renderSearchResults; this covers the other
+    // three states. All text via textContent — no HTML interpolation.
+    _showSearchPanel(state, query) {
+      const old = document.getElementById("search-results-panel");
+      if (old) old.remove();
+      const panel = document.createElement("div");
+      panel.id = "search-results-panel";
+      panel.className = "search-results-panel";
+      const msg = document.createElement("p");
+      msg.className = "search-state-msg";
+      if (state === "loading") {
+        msg.textContent = "Searching\u2026";
+      } else if (state === "empty") {
+        msg.textContent = "No results found for \u201c" + query + "\u201d";
+      } else {
+        msg.textContent = "Search unavailable";
+        const sub = document.createElement("span");
+        sub.className = "search-state-sub";
+        sub.textContent = "Try again.";
+        panel.appendChild(msg);
+        panel.appendChild(sub);
+        const topbar = document.querySelector(".topbar-left");
+        if (topbar) topbar.appendChild(panel);
+        const dismiss = (ev) => {
+          if (!panel.contains(ev.target) && ev.target.id !== "search-input") {
+            panel.remove();
+            document.removeEventListener("click", dismiss);
+          }
+        };
+        setTimeout(() => document.addEventListener("click", dismiss), 0);
+        return;
+      }
+      panel.appendChild(msg);
+      const topbar = document.querySelector(".topbar-left");
+      if (topbar) topbar.appendChild(panel);
+    },
+
+    renderSearchResults(res) {
+      // Remove any existing results panel (including loading state).
+      const old = document.getElementById("search-results-panel");
+      if (old) old.remove();
+      if (!res || (!res.tests.length && !res.findings.length)) {
+        this._showSearchPanel("empty", res ? res.query : "");
+        return;
+      }
+
+      const panel = document.createElement("div");
+      panel.id = "search-results-panel";
+      panel.className = "search-results-panel";
+
+      const header = document.createElement("div");
+      header.className = "search-results-header";
+      const title = document.createElement("span");
+      title.textContent = "Results for \u201c" + res.query + "\u201d";
+      const close = document.createElement("button");
+      close.className = "search-results-close";
+      close.textContent = "\u00d7";
+      close.onclick = () => panel.remove();
+      header.appendChild(title);
+      header.appendChild(close);
+      panel.appendChild(header);
+
+      if (res.tests.length) {
+        const sec = document.createElement("div");
+        sec.className = "search-results-section";
+        const h = document.createElement("p");
+        h.className = "search-results-label";
+        h.textContent = "TESTS (" + res.tests.length + ")";
+        sec.appendChild(h);
+        res.tests.forEach(t => {
+          const row = document.createElement("div");
+          row.className = "search-result-row";
+          row.onclick = () => { panel.remove(); this.viewTestDetail(t.test_id); };
+          const id = document.createElement("span");
+          id.className = "search-result-id";
+          id.textContent = t.test_id || "N/A";
+          const tgt = document.createElement("span");
+          tgt.className = "search-result-meta";
+          tgt.textContent = (t.target || "") +
+            (t.status ? "  \u00b7  " + t.status : "");
+          row.appendChild(id);
+          row.appendChild(tgt);
+          sec.appendChild(row);
+        });
+        panel.appendChild(sec);
+      }
+
+      if (res.findings.length) {
+        const sec = document.createElement("div");
+        sec.className = "search-results-section";
+        const h = document.createElement("p");
+        h.className = "search-results-label";
+        h.textContent = "FINDINGS (" + res.findings.length + ")";
+        sec.appendChild(h);
+        res.findings.forEach(f => {
+          const row = document.createElement("div");
+          row.className = "search-result-row";
+          row.onclick = () => { panel.remove(); this.viewTestDetail(f.test_id); };
+          const id = document.createElement("span");
+          id.className = "search-result-id";
+          id.textContent = f.test_id || "N/A";
+          const meta = document.createElement("span");
+          meta.className = "search-result-meta";
+          meta.textContent = (f.metric || "") +
+            (f.severity ? "  \u00b7  " + f.severity : "");
+          row.appendChild(id);
+          row.appendChild(meta);
+          sec.appendChild(row);
+        });
+        panel.appendChild(sec);
+      }
+
+      // Dismiss on outside click
+      const dismiss = (e) => {
+        if (!panel.contains(e.target) &&
+            e.target.id !== "search-input") {
+          panel.remove();
+          document.removeEventListener("click", dismiss);
+        }
+      };
+      setTimeout(() => document.addEventListener("click", dismiss), 0);
+
+      const topbar = document.querySelector(".topbar-left");
+      if (topbar) topbar.appendChild(panel);
     }
   };
 

@@ -373,7 +373,8 @@ class DashboardServer:
 
         self.console = ConsoleManager(
             workspace_dir if workspace_dir is not None else Path("results"),
-            version=__version__)
+            version=__version__,
+            local_only=is_loopback_host(host))
 
         self.host = host
         self._httpd = ThreadingHTTPServer((host, port), _DashboardHandler)

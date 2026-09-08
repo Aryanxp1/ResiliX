@@ -309,3 +309,174 @@ def test_http_report_download_is_attachment(console_server):
     assert status == 400
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 — Search endpoint HTTP contracts
+# ---------------------------------------------------------------------------
+def test_http_search_with_query_returns_structure(console_server):
+    """GET /api/console/search?q=<query> returns tests/findings arrays."""
+    status, body, _ = _get(
+        console_server.url + "api/console/search?q=t-2026")
+    assert status == 200
+    payload = json.loads(body)
+    assert "query" in payload
+    assert "tests" in payload
+    assert "findings" in payload
+    assert isinstance(payload["tests"], list)
+    assert isinstance(payload["findings"], list)
+    # The fixture has two tests whose IDs contain "t-2026".
+    assert any(t["test_id"] == "t-2026-0001" for t in payload["tests"])
+
+
+def test_http_search_with_empty_query_returns_empty_lists(console_server):
+    """GET /api/console/search?q= (empty) returns empty tests and findings."""
+    status, body, _ = _get(console_server.url + "api/console/search?q=")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["query"] == ""
+    assert payload["tests"] == []
+    assert payload["findings"] == []
+
+
+def test_http_search_missing_q_returns_empty_lists(console_server):
+    """GET /api/console/search with no q param is handled gracefully."""
+    status, body, _ = _get(console_server.url + "api/console/search")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["tests"] == []
+    assert payload["findings"] == []
+
+
+def test_http_search_results_are_json_safe(console_server):
+    """Search results must survive a strict JSON round-trip."""
+    status, body, _ = _get(
+        console_server.url + "api/console/search?q=demo")
+    assert status == 200
+    payload = json.loads(body)
+    assert json.loads(json.dumps(payload)) == payload
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Settings endpoint HTTP contracts
+# ---------------------------------------------------------------------------
+_PUBLIC_SETTINGS_KEYS = {"version", "safety", "engines", "scenarios",
+                          "lifecycle_states"}
+
+_FORBIDDEN_SETTINGS_STRINGS = (
+    "SafetyManager", "EmergencyStop", "_authorized_targets",
+    "_allowlist", "_internal", "_safety",
+)
+
+
+def test_http_settings_returns_expected_top_level_keys(console_server):
+    """GET /api/console/settings exposes the required public top-level keys."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    payload = json.loads(body)
+    assert _PUBLIC_SETTINGS_KEYS <= set(payload), (
+        f"missing keys: {_PUBLIC_SETTINGS_KEYS - set(payload)}")
+
+
+def test_http_settings_safety_contains_only_public_fields(console_server):
+    """The safety sub-object must expose only the known public envelope."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    safety = json.loads(body)["safety"]
+    assert set(safety) == _PUBLIC_SAFETY_KEYS, (
+        f"unexpected safety keys: {set(safety) - _PUBLIC_SAFETY_KEYS}")
+
+
+def test_http_settings_scenarios_is_non_empty_list_of_strings(console_server):
+    """scenarios must be a non-empty list of strings."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    scenarios = json.loads(body)["scenarios"]
+    assert isinstance(scenarios, list)
+    assert len(scenarios) > 0
+    assert all(isinstance(s, str) for s in scenarios)
+
+
+def test_http_settings_lifecycle_states_present(console_server):
+    """lifecycle_states must include the core states the frontend checks."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    states = json.loads(body)["lifecycle_states"]
+    assert isinstance(states, list)
+    for expected in ("idle", "running", "completed", "stopped",
+                     "emergency_stopped"):
+        assert expected in states, f"missing lifecycle state: {expected}"
+
+
+def test_http_settings_exposes_no_internal_fields(console_server):
+    """Settings response must not contain internal class names or fields."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    raw = body.decode("utf-8")
+    for forbidden in _FORBIDDEN_SETTINGS_STRINGS:
+        assert forbidden not in raw, f"internal field leaked: {forbidden}"
+
+
+def test_http_settings_is_json_serializable(console_server):
+    """Settings payload must survive a strict JSON round-trip."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    payload = json.loads(body)
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_http_settings_local_only_is_explicit_boolean_true(console_server):
+    """local_only must be present, a boolean, and true for a loopback server."""
+    status, body, _ = _get(console_server.url + "api/console/settings")
+    assert status == 200
+    payload = json.loads(body)
+    assert "local_only" in payload, "settings must expose local_only"
+    assert isinstance(payload["local_only"], bool), (
+        "local_only must be a boolean, not " + type(payload["local_only"]).__name__)
+    assert payload["local_only"] is True, (
+        "a loopback-bound DashboardServer must report local_only=true")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Report download format contracts
+# ---------------------------------------------------------------------------
+def test_http_report_markdown_download(console_server):
+    """fmt=markdown returns a text/markdown attachment containing the test id."""
+    status, body, headers = _get(
+        console_server.url +
+        "api/console/tests/t-2026-0001/report?fmt=markdown")
+    assert status == 200
+    assert headers.get("Content-Disposition", "").startswith("attachment")
+    ct = headers.get("Content-Type", "")
+    assert "markdown" in ct or "text" in ct
+    assert "t-2026-0001" in body.decode("utf-8")
+
+
+def test_http_report_terminal_download(console_server):
+    """fmt=terminal returns a non-empty text/plain attachment."""
+    status, body, headers = _get(
+        console_server.url +
+        "api/console/tests/t-2026-0001/report?fmt=terminal")
+    assert status == 200
+    assert headers.get("Content-Disposition", "").startswith("attachment")
+    ct = headers.get("Content-Type", "")
+    assert "text" in ct
+    assert len(body) > 0
+
+
+def test_http_report_unknown_test_is_404(console_server):
+    """Report download for a non-existent test returns 404."""
+    status, body = _get_error(
+        console_server.url +
+        "api/console/tests/no-such-test/report?fmt=json")
+    assert status == 404
+    assert json.loads(body)["ok"] is False
+
+
+def test_http_report_traversal_ids_are_rejected(console_server):
+    """Path-traversal test IDs in the report URL must be rejected."""
+    for bad_id in ("../etc/passwd", "..%2Fetc%2Fpasswd",
+                   "t-2026-0001/extra"):
+        url = (console_server.url +
+               "api/console/tests/" + bad_id + "/report?fmt=json")
+        status, _ = _get_error(url)
+        assert status in (400, 404), f"expected 400/404 for id={bad_id!r}"
+
