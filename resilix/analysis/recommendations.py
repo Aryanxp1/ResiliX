@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from ..core.models import (
     DegradationEvent, MetricSnapshot, Recommendation,
-    ResilienceScore,
+    ResilienceScore, Severity,
 )
 
 
@@ -76,6 +76,38 @@ class RecommendationEngine:
                       "the recommendations section in the report.",
                       f"Resilience score {score.total:.1f}/100.")
         return self._recommendations
+
+    def _from_event(self, event: DegradationEvent) -> Recommendation:
+        """Convert a single :class:`DegradationEvent` into a Recommendation,
+        append it to the current generation list, and return it.
+
+        Severity mapping:
+        * ``CRITICAL`` → ``"high"`` priority
+        * ``WARNING``  → ``"medium"`` priority
+        * anything else (``INFO``) → ``"low"`` priority
+
+        The event's ``metric`` becomes the recommendation category so that
+        callers can filter by the affected dimension (e.g. ``"error_rate"``,
+        ``"latency_p95"``). The event ``message`` is used as both the title
+        and detail because it already contains threshold context. The
+        ``observed`` value is embedded in the evidence string so reviewers
+        can see the exact measurement that triggered the event.
+        """
+        severity_to_priority = {
+            Severity.CRITICAL: "high",
+            Severity.WARNING: "medium",
+        }
+        priority = severity_to_priority.get(event.severity, "low")
+        evidence = (
+            f"Observed {event.observed} (threshold {event.threshold}) "
+            f"in phase '{event.phase}'."
+        )
+        rec = Recommendation(
+            priority=priority, category=event.metric,
+            title=event.message, detail=event.message, evidence=evidence,
+        )
+        self._recommendations.append(rec)
+        return rec
 
     def _add(self, priority: str, category: str, title: str,
              evidence: str) -> None:

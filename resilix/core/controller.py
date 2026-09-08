@@ -16,6 +16,8 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from ..core.models import Recommendation  # noqa: F401 – used in type annotation
+
 from ..core.logger import StructuredLogger
 from ..core.metrics import MetricsCollector
 # NOTE: OS metrics are available via MetricsCollector.system_metrics()
@@ -61,6 +63,7 @@ class Controller:
         self._os_metrics: List[Dict[str, Any]] = []
         self._start_time: float = 0.0
         self._end_time: float = 0.0
+        self._recommendations: List[Recommendation] = []
 
     def _ensure_engine(self) -> TestEngine:
         """Lazily import and instantiate the engine from the config."""
@@ -209,20 +212,12 @@ class Controller:
         )
 
         rec_engine = RecommendationEngine()
-        try:
-            recommendations = rec_engine.generate(
-                baseline, peak, recovery, self._score, self._degradation_events,
-            )
-        except AttributeError:
-            # Workaround: older RecommendationEngine lacks _from_event.
-            recommendations = []
-            self._logger.warning(
-                "recommendation-missing",
-                "RecommendationEngine._from_event not implemented; "
-                "recommendations skipped.")
+        self._recommendations = rec_engine.generate(
+            baseline, peak, recovery, self._score, self._degradation_events,
+        )
         self._logger.info("scoring-complete",
                           f"Resilience score: {self._score.total:.1f}/100",
-                          recommendations_count=len(recommendations))
+                          recommendations_count=len(self._recommendations))
 
     def _build_result(self, engine: TestEngine) -> TestResult:
         """Build the final TestResult from all collected data."""
@@ -245,7 +240,7 @@ class Controller:
             peak_metrics=peak,
             recovery=self._recovery_result,
             resilience=self._score or ResilienceScore(),
-            recommendations=[],
+            recommendations=self._recommendations,
             logs=self._logger.export(),
             summary={
                 "total_snapshots": len(self._snapshots),
