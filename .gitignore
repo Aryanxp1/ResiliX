@@ -56,3 +56,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# ResiliX runtime test results
+results/
