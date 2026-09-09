@@ -6,17 +6,15 @@ Tests database backends under controlled query load.
 """
 from __future__ import annotations
 
+import http.client as _hc
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from ..core.models import TestConfig
 from ..core.logger import StructuredLogger
 from ..core.metrics import MetricsCollector
 from .base import TestEngine
-
-# NOTE: `requests` is used here because the Database engine currently models
-# targets as HTTP URLs. In a production deployment this should be replaced with
-# a proper DB driver (e.g. psycopg2, pymysql).
-import requests
 
 
 class DatabaseTestEngine(TestEngine):
@@ -32,7 +30,6 @@ class DatabaseTestEngine(TestEngine):
         self._collector = MetricsCollector()
         self._results: List = []
         self._stop_flag = False
-        self._pool_size = config.scenario.name
 
     def prepare(self) -> None:
         self._logger.info("info", "Database engine prepared",
@@ -50,7 +47,6 @@ class DatabaseTestEngine(TestEngine):
             self._results.append(self._collector.snapshot())
 
     def _run_phase(self, phase) -> None:
-        import threading, time
         # Phase-local signal ending only this phase's workers, kept separate
         # from _stop_flag so a completed phase does not leak stop state into
         # a later lifecycle phase (baseline -> scenario).
@@ -75,7 +71,8 @@ class DatabaseTestEngine(TestEngine):
             w.join(timeout=1.0)
 
     def _db_worker(self, wid, phase, phase_stop) -> None:
-        url = f"https://{self.config.target.host}:{self.config.target.port}{self.config.target.base_path}"
+        target = self.config.target
+        path = target.base_path
         while not self._stop_flag and not phase_stop.is_set() and \
                 self._pace and self._gate:
             if not self._pace.wait(timeout=0.1):
@@ -83,9 +80,17 @@ class DatabaseTestEngine(TestEngine):
             if not self._gate.acquire(timeout=0.1):
                 break
             self._collector.begin_operation()
+            start = time.time()
             try:
-                r = requests.get(url, timeout=5)
-                self._collector.record_success(0.0, r.status_code)
+                conn = (_hc.HTTPSConnection(target.host, target.port, timeout=5)
+                        if target.use_ssl
+                        else _hc.HTTPConnection(target.host, target.port, timeout=5))
+                conn.request("GET", path)
+                resp = conn.getresponse()
+                resp.read()
+                latency_ms = (time.time() - start) * 1000
+                self._collector.record_success(latency_ms, resp.status)
+                conn.close()
             except Exception:
                 self._collector.record_failure("db_error")
             finally:

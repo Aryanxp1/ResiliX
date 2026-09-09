@@ -7,6 +7,9 @@ or evasion features are present.
 """
 from __future__ import annotations
 
+import http.client as _hc
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from ..core.models import TestConfig
@@ -45,7 +48,6 @@ class APITestEngine(TestEngine):
             self._results.append(self._collector.snapshot())
 
     def _run_phase(self, phase) -> None:
-        import threading, time
         # Phase-local signal ending only this phase's workers, kept separate
         # from _stop_flag so a completed phase does not leak stop state into
         # a later lifecycle phase (baseline -> scenario).
@@ -70,6 +72,8 @@ class APITestEngine(TestEngine):
             w.join(timeout=1.0)
 
     def _api_worker(self, wid, phase, phase_stop) -> None:
+        target = self.config.target
+        path = target.base_path
         while not self._stop_flag and not phase_stop.is_set() and \
                 self._pace and self._gate:
             if not self._pace.wait(timeout=0.1):
@@ -77,17 +81,17 @@ class APITestEngine(TestEngine):
             if not self._gate.acquire(timeout=0.1):
                 break
             self._collector.begin_operation()
+            start = time.time()
             try:
-                import http.client as hc
-                conn = hc.HTTPSConnection(self.config.target.host,
-                                           self.config.target.port,
-                                           timeout=5)
-                conn.request("GET", self.config.target.base_path)
+                conn = (_hc.HTTPSConnection(target.host, target.port, timeout=5)
+                        if target.use_ssl
+                        else _hc.HTTPConnection(target.host, target.port, timeout=5))
+                conn.request("GET", path)
                 resp = conn.getresponse()
                 resp.read()
-                ms = resp.getheader("X-Response-Time", "0")
-                self._collector.record_success(float(ms) if ms else 0.0,
-                                                resp.status)
+                latency_ms = (time.time() - start) * 1000
+                self._collector.record_success(latency_ms, resp.status)
+                conn.close()
             except Exception:
                 self._collector.record_failure("api_error")
             finally:
